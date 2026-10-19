@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "requirements": [
+    {
+      "id": "temp-convert",
+      "title": "Temperature converter CLI",
+      "requirement": "A command-line tool temp.py that converts a temperature like '100C' or '-40F' to the other scale and prints it rounded to one decimal place, for example '212.0F'. Malformed input prints an error to stderr and exits with code 2."
+    },
+    {
+      "id": "word-count",
+      "title": "Word count CLI",
+      "requirement": "A command-line tool wc.py that prints the number of lines, words and characters in a text file given as an argument, or in standard input when no file is given, as three numbers separated by spaces. A missing file prints an error to stderr and exits with code 1."
+    },
+    {
+      "id": "roman-numerals",
+      "title": "Roman numerals library",
+      "requirement": "A library roman.py with to_roman(n) and from_roman(s) for whole numbers from 1 to 3999 using standard subtractive notation. Both raise ValueError for out-of-range numbers or invalid numerals, including non-canonical forms such as 'IIII'."
+    },
+    {
+      "id": "stats",
+      "title": "Descriptive statistics library",
+      "requirement": "A library stats.py with mean, median and mode for lists of numbers; mode returns all values tied for most frequent, sorted ascending. Every function raises ValueError on an empty list."
+    },
+    {
+      "id": "bank-account",
+      "title": "Bank account library",
+      "requirement": "A library bank.py with a BankAccount class supporting deposit, withdraw, balance and a list of past transactions. Non-positive amounts raise ValueError, and a withdrawal larger than the balance raises InsufficientFunds without changing the balance."
+    },
+    {
+      "id": "todo-cli",
+      "title": "To-do list CLI",
+      "requirement": "A command-line to-do tool todo.py that stores tasks in a JSON file given by --file, with subcommands add <text>, list, done <id> and remove <id>. IDs are increasing integers that are never reused; an unknown id prints an error to stderr and exits with code 1."
+    },
+    {
+      "id": "csv-summary",
+      "title": "CSV column summary CLI",
+      "requirement": "A command-line tool csvsum.py that reads a CSV file with a header row and prints, for each column whose values are all numeric, its name, minimum, maximum and mean. Non-numeric columns are skipped; a file with no data rows prints an error to stderr and exits with code 1."
+    },
+    {
+      "id": "password-strength",
+      "title": "Password strength library",
+      "requirement": "A library pwcheck.py with check(password) returning a score from 0 to 4 and a list of reasons: one point each for a length of at least 12, both a lowercase and an uppercase letter, a digit, and a symbol. A password from a built-in list of ten common passwords always scores 0."
+    },
+    {
+      "id": "matrix",
+      "title": "Matrix operations library",
+      "requirement": "A library matrix.py with add, multiply and transpose for matrices given as lists of lists of numbers. Mismatched dimensions, empty matrices or ragged rows raise ValueError."
+    },
+    {
+      "id": "rate-limiter",
+      "title": "Token-bucket rate limiter library",
+      "requirement": "A library ratelimit.py with a TokenBucket(capacity, refill_per_second, clock) class whose allow() returns True and uses up a token when one is available, and returns False otherwise. The clock is a callable returning seconds, so behavior can be tested without sleeping."
+    }
+  ]
+}
