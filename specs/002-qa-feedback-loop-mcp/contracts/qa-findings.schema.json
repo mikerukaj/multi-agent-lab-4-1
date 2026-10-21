@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "qa-findings.schema.json",
+  "title": "QA findings (the fix instruction list)",
+  "description": "The normalised findings QAAgent.run_iteration returns in QAIterationResult.findings and the team stores in Iteration.findings. Blocking findings come first. tests/test_qa_agent.py checks QA output against this schema. See data-model.md (QAFinding) and research.md R10.",
+  "type": "array",
+  "items": { "$ref": "#/$defs/finding" },
+  "$defs": {
+    "constitution_rule": {
+      "description": "The constitution v1.1.1 MUST rules a blocking style finding may cite (FR-104a). Mirrors CONSTITUTION_RULES in agents/qa_agent.py.",
+      "enum": [
+        "intent-revealing-names",
+        "function-does-one-thing",
+        "public-api-type-hints-and-docstrings",
+        "comments-explain-why",
+        "no-commented-out-code",
+        "explicit-error-handling",
+        "extract-triplicated-logic",
+        "python-3.12-only",
+        "pep8-pep257",
+        "import-grouping",
+        "no-wildcard-imports",
+        "no-hardcoded-secrets",
+        "main-guard"
+      ]
+    },
+    "finding": {
+      "type": "object",
+      "required": [
+        "finding_id", "kind", "severity", "rule", "file", "location", "problem",
+        "expected", "likely_cause", "fix_instruction", "test_ids", "state", "first_seen"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "finding_id": { "type": "string", "pattern": "^F[0-9]+-[0-9]+$" },
+        "kind": { "enum": ["failing_test", "bug", "style"] },
+        "severity": { "enum": ["blocking", "advisory"] },
+        "rule": {
+          "anyOf": [{ "$ref": "#/$defs/constitution_rule" }, { "type": "null" }]
+        },
+        "file": { "type": "string" },
+        "location": { "type": "string" },
+        "problem": { "type": "string", "minLength": 1 },
+        "expected": { "type": "string", "minLength": 1 },
+        "likely_cause": { "type": "string" },
+        "fix_instruction": { "type": "string", "minLength": 1 },
+        "test_ids": { "type": "array", "items": { "type": "string" } },
+        "state": { "enum": ["open", "fixed", "disputed", "withdrawn"] },
+        "first_seen": { "type": "integer", "minimum": 1 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "enum": ["failing_test", "bug"] } } },
+          "then": {
+            "properties": {
+              "severity": { "const": "blocking" },
+              "likely_cause": { "minLength": 1 }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "failing_test" } } },
+          "then": { "properties": { "test_ids": { "minItems": 1 } } }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": { "const": "style" },
+              "severity": { "const": "blocking" }
+            }
+          },
+          "then": { "properties": { "rule": { "$ref": "#/$defs/constitution_rule" } } }
+        },
+        {
+          "if": { "properties": { "kind": { "enum": ["failing_test", "bug"] } } },
+          "then": { "properties": { "rule": { "type": "null" } } }
+        }
+      ]
+    }
+  }
+}

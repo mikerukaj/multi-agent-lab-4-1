@@ -105,7 +105,12 @@ iteration goes like this:
    public interface (signatures and docstrings, extracted with `ast`, with no function
    bodies), so expected values come from the spec rather than from whatever the code
    does. Every test file lists the acceptance criteria it checks. Criteria that are not
-   in the spec, and paths outside `tests/`, are refused.
+   copied from the spec, and paths outside `tests/`, are refused.
+
+   Every QA reply is checked in full before anything is written. A reply that is
+   refused, isn't valid JSON, or is cut off at the output limit gets one corrected
+   attempt: QA is asked again with the reason. A second bad reply ends the iteration as
+   before.
 2. **Run them for real.** pytest runs in the same no-network, read-only sandbox image as
    the Coder's code, with `tests/` mounted read-only. `-c /dev/null` and `--confcutdir`
    stop a stray `pytest.ini` or `conftest.py` from changing the run, and results come back

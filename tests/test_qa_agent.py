@@ -279,15 +279,67 @@ class IterationOneTests(QATestCase):
             self.client.requests[0]["output_config"]["format"]["type"], "json_schema"
         )
 
-    def test_malformed_replies_end_the_turn_with_an_error(self) -> None:
+    def test_malformed_replies_end_the_turn_after_one_correction(self) -> None:
         outside = {**TEST_FILE, "path": "app_test.py"}
-        result = self.run_qa([write_tests_reply(outside)], [scripted_test_run()])
-        self.assertIn("tests/", result.error)
         unknown = {**TEST_FILE, "criteria": ["Something the spec never said"]}
-        result = self.run_qa([write_tests_reply(unknown)], [scripted_test_run()])
-        self.assertIn("criterion", result.error)
-        result = self.run_qa([reply({"test_files": [], "notes": ""})], [scripted_test_run()])
-        self.assertIn("no test files", result.error)
+        empty = reply({"test_files": [], "notes": ""})
+        for bad, text in (
+            (write_tests_reply(outside), "tests/"),
+            (write_tests_reply(unknown), "criterion"),
+            (empty, "no test files"),
+        ):
+            with self.subTest(text=text):
+                result = self.run_qa([bad, bad], [scripted_test_run()])
+                self.assertIn(text, result.error)
+                self.assertEqual(len(self.client.requests), 2)
+                self.assertIn("Your previous reply was rejected", self.client.user_text(1))
+                self.assertEqual(self.runner.calls, 0)
+
+    def test_a_corrected_reply_is_used_and_names_the_rejection(self) -> None:
+        paraphrased = {**TEST_FILE, "criteria": ["adding 1 and 2 gives 3"]}
+        result = self.run_qa(
+            [write_tests_reply(paraphrased), write_tests_reply(), review_reply()],
+            [scripted_test_run()],
+        )
+        self.assertIsNone(result.error)
+        self.assertEqual(result.test_suite, {TEST_FILE["path"]: TEST_FILE["content"]})
+        retry_prompt = self.client.user_text(1)
+        self.assertTrue(retry_prompt.startswith(self.client.user_text(0)))
+        self.assertIn("adding 1 and 2 gives 3", retry_prompt)
+        self.assertIn("character for character", retry_prompt)
+
+    def test_a_cut_off_reply_is_asked_again(self) -> None:
+        result = self.run_qa(
+            [reply(stop_reason="max_tokens"), write_tests_reply(), review_reply()],
+            [scripted_test_run()],
+        )
+        self.assertIsNone(result.error)
+        self.assertIn("cut off at the output limit", self.client.user_text(1))
+        self.assertIn("fewer or shorter test files", self.client.user_text(1))
+
+    def test_nothing_is_written_from_a_rejected_reply(self) -> None:
+        bad_second = {**TEST_FILE, "path": "tests/test_more.py", "criteria": ["Invented"]}
+        result = self.run_qa(
+            [write_tests_reply(TEST_FILE, bad_second)] * 2, [scripted_test_run()]
+        )
+        self.assertIn("Invented", result.error)
+        writes = [c for c in FakeFileTools.sessions[-1].calls if c[0] == "write_file"]
+        self.assertEqual(writes, [])
+        self.assertFalse((self.workspace / "tests" / "test_app.py").exists())
+
+    def test_a_review_with_a_bad_regression_test_is_asked_again(self) -> None:
+        bad_regression = {"finding_index": 0, "path": "regress.py",
+                          "content": "def test_r(): pass\n", "criteria": ["add(1, 2) returns 3"]}
+        good_regression = {**bad_regression, "path": "tests/test_regress.py"}
+        result = self.run_qa(
+            [write_tests_reply(),
+             review_reply([raw_finding()], [bad_regression]),
+             review_reply([raw_finding()], [good_regression])],
+            [scripted_test_run()],
+        )
+        self.assertIsNone(result.error)
+        self.assertIn("tests/test_regress.py", result.test_suite)
+        self.assertIn("regress.py", self.client.user_text(2))
 
     def test_load_repair_retries_then_gives_up(self) -> None:
         broken = scripted_test_run(loaded=False)
@@ -309,14 +361,17 @@ class IterationOneTests(QATestCase):
 
     def test_model_failures_become_errors_not_exceptions(self) -> None:
         request = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
-        for first, text in (
-            (reply(stop_reason="refusal"), "declined"),
-            (anthropic.APIConnectionError(request=request), "Model call failed"),
-            (self.bad_json_reply(), "not valid JSON"),
+        for script, text in (
+            ([reply(stop_reason="refusal")], "declined"),
+            ([anthropic.APIConnectionError(request=request)], "Model call failed"),
+            ([self.bad_json_reply()] * 2, "not valid JSON"),
+            ([reply(stop_reason="max_tokens")] * 2, "cut off at the output limit"),
         ):
             with self.subTest(text=text):
-                result = self.run_qa([first], [scripted_test_run()])
+                result = self.run_qa(list(script), [scripted_test_run()])
                 self.assertIn(text, result.error)
+                # Refusals and failed calls are not asked again; bad replies are, once.
+                self.assertEqual(len(self.client.requests), len(script))
 
     @staticmethod
     def bad_json_reply() -> SimpleNamespace:
@@ -464,8 +519,24 @@ class LaterIterationTests(QATestCase):
 
     def test_dispute_decision_for_an_unknown_finding_is_an_error(self) -> None:
         responses = [{"finding_id": "F1-2", "action": "disputed", "reason": "x"}]
-        result = self.later([disputes_reply("keep")], [scripted_test_run()], responses=responses)
+        result = self.later(
+            [disputes_reply("keep")] * 2, [scripted_test_run()], responses=responses
+        )
         self.assertIn("F1-1", result.error)
+        self.assertEqual(len(self.client.requests), 2)
+
+    def test_corrected_dispute_reply_is_used(self) -> None:
+        responses = [{"finding_id": "F1-1", "action": "disputed", "reason": "x"}]
+        bad_file = {**TEST_FILE, "criteria": ["A criterion the spec never had"]}
+        result = self.later(
+            [disputes_reply("correct", [bad_file]), disputes_reply("keep"), review_reply()],
+            [scripted_test_run()], responses=responses,
+        )
+        self.assertIsNone(result.error)
+        self.assertEqual([d["decision"] for d in result.disputes], ["keep"])
+        self.assertIn("A criterion the spec never had", self.client.user_text(1))
+        writes = [c for c in FakeFileTools.sessions[-1].calls if c[0] == "write_file"]
+        self.assertEqual(writes, [])
 
 
 class NormaliseTests(unittest.TestCase):

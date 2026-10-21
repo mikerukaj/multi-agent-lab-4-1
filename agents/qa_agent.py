@@ -13,6 +13,7 @@ import ast
 import json
 import os
 import shutil
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path, PurePosixPath
 
@@ -34,6 +35,16 @@ from tools.python_exec import SANDBOX_IMAGE, ensure_sandbox
 from tools.test_runner import run_pytest
 
 MAX_REPAIR_ATTEMPTS = 3
+REPLY_ATTEMPTS = 2
+"""Tries per structured QA reply: the first answer, plus one corrected answer after a
+rejection. A single paraphrased criterion or cut-off reply used to end the whole
+iteration (baseline benchmark 2026-10-20: 6 of 10 runs)."""
+CORRECTION_NOTE = """\
+Your previous reply was rejected: {reason}
+Reply again with the complete, corrected answer. Copy every criterion character for \
+character from the specification above, put every test file under tests/ with a .py \
+name, and keep the reply short enough to finish: write fewer or shorter test files if \
+needed."""
 REPORT_PATH = ".qa/report.md"
 TIMEOUT_TEST_ID = "<timeout>"
 CONSTITUTION_RULES = (
@@ -157,6 +168,10 @@ leave its rule empty.
 
 class QAStepError(Exception):
     """One step of a QA iteration could not finish; the message says why."""
+
+
+class QAReplyRejected(QAStepError):
+    """The model's reply was malformed, cut off or failed a check; QA may be asked again."""
 
 
 @dataclass
@@ -359,14 +374,17 @@ class QAAgent:
             "Decide each dispute by checking the specification: keep the test or finding, "
             "or correct it. Return corrected test files for every 'correct' decision.",
         ])
-        data = self._ask(turn, user_text, DISPUTES_FORMAT)
-        decided = {decision["finding_id"] for decision in data["decisions"]}
-        unknown = sorted(decided - set(disputed))
-        if unknown:
-            raise QAStepError(
-                f"Malformed QA reply: dispute decision for {', '.join(unknown)}, "
-                "which the Coder did not dispute"
-            )
+        def check(data: dict) -> None:
+            decided = {decision["finding_id"] for decision in data["decisions"]}
+            unknown = sorted(decided - set(disputed))
+            if unknown:
+                raise QAReplyRejected(
+                    f"Malformed QA reply: dispute decision for {', '.join(unknown)}, "
+                    "which the Coder did not dispute"
+                )
+            check_test_files(data["corrected_files"], context["spec"])
+
+        data = self._ask(turn, user_text, DISPUTES_FORMAT, check)
         corrected = [d["finding_id"] for d in data["decisions"] if d["decision"] == "correct"]
         owner = corrected[0] if len(corrected) == 1 else None
         self._write_test_files(turn, data["corrected_files"], "dispute_correction", owner)
@@ -415,9 +433,12 @@ class QAAgent:
             "Write the full pytest suite for this specification under tests/. Cover every "
             "acceptance criterion and the edge cases the specification names.",
         ])
-        data = self._ask(turn, user_text, WRITE_TESTS_FORMAT)
-        if not data["test_files"]:
-            raise QAStepError("Malformed QA reply: no test files were written")
+        def check(data: dict) -> None:
+            if not data["test_files"]:
+                raise QAReplyRejected("Malformed QA reply: no test files were written")
+            check_test_files(data["test_files"], turn.context["spec"])
+
+        data = self._ask(turn, user_text, WRITE_TESTS_FORMAT, check)
         self._write_test_files(turn, data["test_files"], "initial")
 
     def _run_until_loaded(self, turn: _Turn) -> TestRun:
@@ -432,7 +453,10 @@ class QAAgent:
                 "Current test files:\n" + render_files(turn.test_suite),
                 "Return corrected versions of the test files that need changes.",
             ])
-            data = self._ask(turn, user_text, WRITE_TESTS_FORMAT)
+            data = self._ask(
+                turn, user_text, WRITE_TESTS_FORMAT,
+                lambda reply: check_test_files(reply["test_files"], turn.context["spec"]),
+            )
             self._write_test_files(turn, data["test_files"], "load_repair")
             test_run = self._run(turn)
         if not test_run["loaded"]:
@@ -469,18 +493,9 @@ class QAAgent:
             "failing_test, with its test_ids), every bug, and style problems. For a bug no "
             "test covers, you may add a regression test that reproduces it."
         )
-        data = self._ask(turn, "\n\n".join(parts), REVIEW_FORMAT)
-        self._check_review(data, context)
-        return data
-
-    def _check_review(self, data: dict, context: QAContext) -> None:
-        known = {finding["finding_id"] for finding in context["previous_findings"]}
-        for item in data["findings"]:
-            if item["same_as"] and item["same_as"] not in known:
-                raise QAStepError(f"Malformed QA reply: same_as names unknown {item['same_as']}")
-        for test in data["regression_tests"]:
-            if not 0 <= test["finding_index"] < len(data["findings"]):
-                raise QAStepError("Malformed QA reply: regression test points at no finding")
+        return self._ask(
+            turn, "\n\n".join(parts), REVIEW_FORMAT, lambda data: check_review(data, context)
+        )
 
     def _write_regression_tests(self, turn: _Turn, review: dict) -> None:
         iteration = turn.context["iteration"]
@@ -492,15 +507,13 @@ class QAAgent:
     def _write_test_files(
         self, turn: _Turn, files: list[dict], reason: str, finding_id: str | None = None
     ) -> None:
-        """Validate and write test files through MCP, recording each change."""
-        allowed = all_criteria(turn.context["spec"])
+        """Write test files through MCP, recording each change.
+
+        Every caller has already passed the files through ``check_test_files`` as part of
+        the reply's check, so nothing is written from a reply that fails it.
+        """
         for test_file in files:
             path = checked_test_path(test_file["path"])
-            for criterion in test_file["criteria"]:
-                if _normal(criterion) not in allowed:
-                    raise QAStepError(
-                        f"Malformed QA reply: criterion {criterion!r} is not in the specification"
-                    )
             self._write_file(turn, path, test_file["content"])
             turn.test_changes.append(
                 TestChange(path=path, reason=reason, finding_id=finding_id,
@@ -515,7 +528,35 @@ class QAAgent:
             raise QAStepError(f"Could not write {path}: {text}")
         turn.test_suite[path] = content
 
-    def _ask(self, turn: _Turn, user_text: str, schema: dict) -> dict:
+    def _ask(
+        self, turn: _Turn, user_text: str, schema: dict,
+        check: Callable[[dict], None] | None = None,
+    ) -> dict:
+        """Get a structured reply that passes ``check``, asking once more after a rejection.
+
+        ``check`` must not write anything: it raises ``QAReplyRejected`` for a reply that
+        can't be used. A malformed or cut-off reply is rejected the same way. The second
+        request repeats ``user_text`` with the rejection reason. Refusals and failed model
+        calls are not retried.
+
+        Raises:
+            QAStepError: for a refusal or failed call, or the last rejection when the
+                corrected reply is rejected too.
+        """
+        text = user_text
+        for attempt in range(1, REPLY_ATTEMPTS + 1):
+            try:
+                data = self._ask_once(turn, text, schema)
+                if check:
+                    check(data)
+                return data
+            except QAReplyRejected as rejection:
+                if attempt == REPLY_ATTEMPTS:
+                    raise
+                text = f"{user_text}\n\n{CORRECTION_NOTE.format(reason=rejection)}"
+        raise AssertionError("unreachable: the loop returns or raises")
+
+    def _ask_once(self, turn: _Turn, user_text: str, schema: dict) -> dict:
         """Make one structured-output model call and return its JSON."""
         try:
             response = self._client.beta.messages.create(**self._request(user_text, schema))
@@ -526,11 +567,16 @@ class QAAgent:
         )
         if response.stop_reason == "refusal":
             raise QAStepError(refusal_message(response.stop_details))
+        if response.stop_reason == "max_tokens":
+            raise QAReplyRejected(
+                "Malformed QA reply: the reply was cut off at the output limit before it "
+                "was complete"
+            )
         text = "".join(block.text for block in response.content if block.type == "text")
         try:
             return json.loads(text)
         except json.JSONDecodeError as error:
-            raise QAStepError(f"Model output is not valid JSON: {text[:200]!r}") from error
+            raise QAReplyRejected(f"Model output is not valid JSON: {text[:200]!r}") from error
 
     def _request(self, user_text: str, schema: dict) -> dict:
         return build_qa_request(self.config, user_text, schema)
@@ -872,13 +918,51 @@ def all_criteria(spec: dict) -> set[str]:
     return {_normal(criterion) for criterion in criteria}
 
 
+def check_test_files(files: list[dict], spec: dict) -> None:
+    """Check every test file in a reply before any is written.
+
+    Raises:
+        QAReplyRejected: if a path is not a ``.py`` file inside ``tests/``, or a listed
+            criterion is not copied from the specification.
+    """
+    allowed = all_criteria(spec)
+    for test_file in files:
+        checked_test_path(test_file["path"])
+        for criterion in test_file["criteria"]:
+            if _normal(criterion) not in allowed:
+                raise QAReplyRejected(
+                    f"Malformed QA reply: criterion {criterion!r} is not in the specification"
+                )
+
+
+def check_review(data: dict, context: QAContext) -> None:
+    """Check a review reply, including its regression tests, before anything is written.
+
+    Raises:
+        QAReplyRejected: if ``same_as`` names an unknown finding, a regression test points
+            at no finding, or a regression test file fails ``check_test_files``.
+    """
+    known = {finding["finding_id"] for finding in context["previous_findings"]}
+    for item in data["findings"]:
+        if item["same_as"] and item["same_as"] not in known:
+            raise QAReplyRejected(f"Malformed QA reply: same_as names unknown {item['same_as']}")
+    for test in data["regression_tests"]:
+        if not 0 <= test["finding_index"] < len(data["findings"]):
+            raise QAReplyRejected("Malformed QA reply: regression test points at no finding")
+    check_test_files(data["regression_tests"], context["spec"])
+
+
 def checked_test_path(path: str) -> str:
-    """Return ``path`` if it is a ``.py`` file inside ``tests/``; otherwise raise."""
+    """Return ``path`` if it is a ``.py`` file inside ``tests/``; otherwise raise.
+
+    Raises:
+        QAReplyRejected: if the path leaves ``tests/`` or is not a ``.py`` file.
+    """
     posix = PurePosixPath(path)
     if posix.is_absolute() or ".." in posix.parts or posix.parts[:1] != ("tests",):
-        raise QAStepError(f"Malformed QA reply: test file {path!r} is not inside tests/")
+        raise QAReplyRejected(f"Malformed QA reply: test file {path!r} is not inside tests/")
     if posix.suffix != ".py":
-        raise QAStepError(f"Malformed QA reply: test file {path!r} is not a .py file")
+        raise QAReplyRejected(f"Malformed QA reply: test file {path!r} is not a .py file")
     return posix.as_posix()
 
 

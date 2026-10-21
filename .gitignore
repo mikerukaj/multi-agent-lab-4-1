@@ -24,6 +24,6 @@ Thumbs.db
 .idea/
 
 # Claude & Speckit
-.claude/
-.specify/
-specs/
+#.claude/
+#.specify/
+#specs/
