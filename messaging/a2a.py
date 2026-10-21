@@ -215,7 +215,15 @@ class SkillRejected(Exception):
 
 
 class SkillFailed(Exception):
-    """Raised by a skill handler whose agent could not finish the work (task FAILED)."""
+    """Raised by a skill handler whose agent could not finish the work (task FAILED).
+
+    ``artifacts`` are attached to the failed task, so the sender still gets the
+    structured outcome (for example the ``DependencyFailure`` that stopped the work).
+    """
+
+    def __init__(self, message: str, artifacts: list[Artifact] | None = None) -> None:
+        super().__init__(message)
+        self.artifacts = list(artifacts or [])
 
 
 def json_copy(value: Any) -> Any:

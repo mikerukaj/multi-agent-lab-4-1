@@ -26,6 +26,10 @@ scripts/test.sh; echo "exit=$?"
 - skips only with a stated reason (`Docker is not available`, `RUN_LIVE_E2E not set`);
 - it finishes in under 5 minutes.
 
+The same suite inside the image (US5 scenario 3) uses the `test` stage and the
+`docker run` line in [contracts/deployment.md](contracts/deployment.md) "Running the suite
+in the image". It must give the same pass and skip counts.
+
 The layers can be run one at a time:
 
 ```bash

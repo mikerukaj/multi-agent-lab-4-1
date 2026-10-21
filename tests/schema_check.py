@@ -1,12 +1,14 @@
-"""A small stdlib JSON-Schema checker for QA's findings (contracts/qa-findings.schema.json).
+"""A small stdlib JSON-Schema checker for the contracts' schemas.
 
-The constitution keeps project tests on the standard library, so this implements
-only the keywords that schema uses: ``type``, ``enum``, ``const``, ``pattern``,
-``minLength``, ``minimum``, ``minItems``, ``required``, ``additionalProperties``,
-``properties``, ``items``, ``$ref`` (local ``#/$defs/...``), ``anyOf`` and
-``allOf`` with ``if``/``then``. ``specs/`` is not in git, so the schema is copied
-to ``tests/fixtures/``; ``SchemaCopyTests`` in tests/test_qa_agent.py checks the
-copy matches the contract whenever ``specs/`` is present.
+Used for QA's findings (002 contracts/qa-findings.schema.json), the run event record
+and the cost report (003 contracts). The constitution keeps project tests on the
+standard library, so this implements only the keywords those schemas use: ``type``
+(one name or a list), ``enum``, ``const``, ``pattern``, ``minLength``, ``minimum``,
+``exclusiveMinimum``, ``maximum``, ``minItems``, ``maxItems``, ``required``,
+``additionalProperties``, ``properties``, ``items``, ``$ref`` (local
+``#/$defs/...``), ``anyOf`` and ``allOf`` with ``if``/``then``. ``format`` is
+ignored. The schemas are copied to ``tests/fixtures/``; the ``SchemaCopyTests`` check
+each copy matches its contract whenever ``specs/`` is present.
 
 The file name does not match ``test*.py``, so ``unittest discover`` never runs it.
 """
@@ -26,9 +28,22 @@ JSON_TYPES = {
 }
 
 
+SPECS = Path(__file__).resolve().parents[1] / "specs"
+
+
 def load_schema() -> dict:
     """Return the findings schema from the test fixture."""
     return json.loads(FIXTURE.read_text(encoding="utf-8"))
+
+
+def load_fixture_schema(name: str) -> dict:
+    """Return a schema copied into ``tests/fixtures/`` (e.g. ``run-event.schema.json``)."""
+    return json.loads((FIXTURE.parent / name).read_text(encoding="utf-8"))
+
+
+def contract_path(feature: str, name: str) -> Path:
+    """Where a feature's contract schema lives (``specs/`` may be absent)."""
+    return SPECS / feature / "contracts" / name
 
 
 def schema_errors(value, schema: dict, root: dict, path: str = "$") -> list[str]:
@@ -66,10 +81,18 @@ def _scalar_errors(value, schema: dict, path: str) -> list[str]:
             errors.append(f"{path}: {value!r} does not match {schema['pattern']}")
         if len(value) < schema.get("minLength", 0):
             errors.append(f"{path}: shorter than {schema['minLength']}")
-    if isinstance(value, int) and "minimum" in schema and value < schema["minimum"]:
-        errors.append(f"{path}: below {schema['minimum']}")
-    if isinstance(value, list) and len(value) < schema.get("minItems", 0):
-        errors.append(f"{path}: fewer than {schema['minItems']} items")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if "minimum" in schema and value < schema["minimum"]:
+            errors.append(f"{path}: below {schema['minimum']}")
+        if "exclusiveMinimum" in schema and value <= schema["exclusiveMinimum"]:
+            errors.append(f"{path}: not above {schema['exclusiveMinimum']}")
+        if "maximum" in schema and value > schema["maximum"]:
+            errors.append(f"{path}: above {schema['maximum']}")
+    if isinstance(value, list):
+        if len(value) < schema.get("minItems", 0):
+            errors.append(f"{path}: fewer than {schema['minItems']} items")
+        if "maxItems" in schema and len(value) > schema["maxItems"]:
+            errors.append(f"{path}: more than {schema['maxItems']} items")
     return errors
 
 
@@ -84,7 +107,9 @@ def _object_errors(value: dict, schema: dict, root: dict, path: str) -> list[str
     return errors
 
 
-def _has_type(value, expected: str) -> bool:
+def _has_type(value, expected: str | list) -> bool:
+    if isinstance(expected, list):
+        return any(_has_type(value, option) for option in expected)
     if expected in ("integer", "number") and isinstance(value, bool):
         return False
     return isinstance(value, JSON_TYPES[expected])

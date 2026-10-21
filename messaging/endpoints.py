@@ -6,8 +6,14 @@ an A2A ``Message``, pass its ``data`` part through as the JSON-only request payl
 call the agent by method name, and return the result as an artifact. This module is
 duck-typed and imports no agent module, so neither agent depends on the other
 (SC-110). See specs/002-qa-feedback-loop-mcp/contracts/a2a-binding.md §7, §8, §10.
+
+With the run's ``services`` (also duck-typed), each handler continues the trace from
+the headers in the message metadata, attributes events on its broker thread to its
+agent and stage, and opens the invocation's ``agent:*`` span
+(specs/003-production-hardening/contracts/tracing.md).
 """
 
+import contextlib
 from pathlib import Path
 
 from messaging import __version__
@@ -33,7 +39,7 @@ REVIEW_SKILL = "review-program"
 REPORT_SKILL = "final-report"
 FIX_SKILL = "fix-program"
 FIX_KEYS = ("workspace", "iteration", "answer_ids", "findings")
-FAILED_STATUSES = ("refused", "error")
+FAILED_STATUSES = ("refused", "error", "dependency_unavailable", "budget_exceeded")
 REVIEW_KEYS = ("iteration", "workspace", "spec", "source_files", "test_suite")
 REPORT_KEYS = ("run_id", "workspace", "status", "end_reason", "max_iterations", "iterations")
 
@@ -60,7 +66,7 @@ def qa_card(version: str = __version__) -> AgentCard:
     )
 
 
-def qa_handler(qa) -> SkillHandler:
+def qa_handler(qa, services=None) -> SkillHandler:
     """Return the skill handler for ``qa`` (any object with ``run_iteration`` and
     ``final_report``)."""
 
@@ -68,12 +74,17 @@ def qa_handler(qa) -> SkillHandler:
         skill = message.get("metadata", {}).get("skillId")
         if skill == REVIEW_SKILL:
             context = _payload(message, REVIEW_KEYS)
-            result = qa.run_iteration(context)
+            with _observed(services, message, "qa", "qa_review", "review",
+                           iteration=context["iteration"]):
+                result = qa.run_iteration(context)
+            item = artifact("qa-iteration", [data_part(result.to_dict())])
             if result.error:
-                raise SkillFailed(result.error)
-            return [artifact("qa-iteration", [data_part(result.to_dict())])]
+                raise SkillFailed(result.error, [item])
+            return [item]
         if skill == REPORT_SKILL:
-            report = qa.final_report(_payload(message, REPORT_KEYS))
+            request = _payload(message, REPORT_KEYS)
+            with _observed(services, message, "qa", "final_report", "final_report"):
+                report = qa.final_report(request)
             return [artifact("qa-report", [data_part(report)])]
         raise SkillRejected(f"{QA_AGENT} has no skill {skill!r}")
 
@@ -96,7 +107,7 @@ def coder_card(version: str = __version__) -> AgentCard:
     )
 
 
-def coder_handler(coder) -> SkillHandler:
+def coder_handler(coder, services=None) -> SkillHandler:
     """Return the skill handler for ``coder`` (any object with ``run``)."""
 
     def handle(message: Message) -> list[Artifact]:
@@ -107,30 +118,57 @@ def coder_handler(coder) -> SkillHandler:
         brief = find_text(message)
         if not brief:
             raise SkillRejected("the fix request needs a text part holding the fix brief")
-        result = coder.run(
-            brief, Path(request["workspace"]), answer_ids=list(request["answer_ids"])
-        )
+        with _observed(services, message, "coder", "fix", "fix",
+                       iteration=request["iteration"]):
+            result = coder.run(
+                brief, Path(request["workspace"]), answer_ids=list(request["answer_ids"])
+            )
         if result.status in FAILED_STATUSES:
-            raise SkillFailed(f"{result.status}: {result.error or result.explanation}")
-        fix = {
-            "status": result.status,
-            "hit_step_cap": result.status == "step_limit",
-            "steps_used": result.steps_used,
-            "files_changed": list(result.files_written),
-            "responses": list(result.finding_responses),
-            "error": result.error,
-        }
-        item = artifact("coder-fix", [data_part(json_copy(fix))])
-        item["metadata"] = {"usage": dict(result.usage)}
-        return [item]
+            raise SkillFailed(
+                f"{result.status}: {result.error or result.explanation}", [_fix_artifact(result)]
+            )
+        return [_fix_artifact(result)]
 
     return handle
 
 
-def register_team_agents(broker: A2ABroker, coder, qa, version: str = __version__) -> None:
+def _fix_artifact(result) -> Artifact:
+    """The ``coder-fix`` artifact: the fix outcome, with usage and any failure as metadata."""
+    fix = {
+        "status": result.status,
+        "hit_step_cap": result.status == "step_limit",
+        "steps_used": result.steps_used,
+        "files_changed": list(result.files_written),
+        "responses": list(result.finding_responses),
+        "error": result.error,
+    }
+    item = artifact("coder-fix", [data_part(json_copy(fix))])
+    # Duck-typed: a Coder result without a ``failure`` attribute reports none.
+    failure = getattr(result, "failure", None)
+    item["metadata"] = json_copy({"usage": dict(result.usage), "failure": failure})
+    return item
+
+
+def register_team_agents(
+    broker: A2ABroker, coder, qa, version: str = __version__, services=None
+) -> None:
     """Register the team's A2A endpoints (QA and Coder) on ``broker``."""
-    broker.register(qa_card(version), qa_handler(qa))
-    broker.register(coder_card(version), coder_handler(coder))
+    broker.register(qa_card(version), qa_handler(qa, services))
+    broker.register(coder_card(version), coder_handler(coder, services))
+
+
+@contextlib.contextmanager
+def _observed(services, message: Message, agent: str, stage: str, invocation: str, **fields):
+    """On this broker thread: continue the sender's trace, set the event context, and
+    open the invocation's agent span. A no-op without ``services``."""
+    if services is None:
+        yield
+        return
+    headers = message.get("metadata", {}).get("trace") or {}
+    with services.tracer.continue_from(headers), \
+            services.events.context(agent=agent, stage=stage, **fields), \
+            services.tracer.agent_span(agent, invocation, stage=stage, **fields):
+        yield
 
 
 def _payload(message: Message, required: tuple[str, ...]) -> dict:

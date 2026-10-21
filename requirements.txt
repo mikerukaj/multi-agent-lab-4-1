@@ -1,6 +1,7 @@
 anthropic==1.11.0
 chromadb==1.5.9
 langgraph==1.2.12
+langsmith==0.14.11
 mcp==2.3.0
 pysqlite3-binary==0.5.4.post2; sys_platform == "linux"
 python-dotenv==1.2.3

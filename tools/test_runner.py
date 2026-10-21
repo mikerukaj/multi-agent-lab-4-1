@@ -8,6 +8,7 @@ workspace. ``-c /dev/null`` and ``--confcutdir`` stop a ``pytest.ini``,
 tests run. See specs/002-qa-feedback-loop-mcp/research.md R7.
 """
 
+import os
 import secrets
 import subprocess
 import tempfile
@@ -16,12 +17,15 @@ import xml.etree.ElementTree as ElementTree
 from pathlib import Path
 
 from orchestration.state import TestCaseResult, TestRun
+from resilience.circuit import DependencyGuard, GuardFailure
 from tools.python_exec import (
     SANDBOX_IMAGE,
     SANDBOX_WORKDIR,
+    SandboxUnavailableError,
     cap_output,
-    kill_container,
+    guarded_run,
     locked_down_run,
+    run_container,
 )
 
 MAX_XML_BYTES = 2 * 1024 * 1024
@@ -32,13 +36,15 @@ LOADED_EXIT_CODES = (0, 1)
 OUT_DIR = "/qa-out"
 
 
-def pytest_command(workspace: Path, out_dir: Path, name: str, image: str) -> list[str]:
+def pytest_command(
+    workspace: Path, out_dir: Path, name: str, image: str, run_id: str = ""
+) -> list[str]:
     """Build the ``docker run`` command for one sandboxed pytest run."""
     volumes = [f"{out_dir.resolve()}:{OUT_DIR}:rw"]
     tests = workspace.resolve() / "tests"
     volumes.insert(0, f"{tests}:{SANDBOX_WORKDIR}/tests:ro")
     return [
-        *locked_down_run(name, workspace, volumes),
+        *locked_down_run(name, workspace, volumes, run_id),
         image,
         "python", "-s", "-m", "pytest", "tests", "-q",
         "-p", "no:cacheprovider",
@@ -50,33 +56,57 @@ def pytest_command(workspace: Path, out_dir: Path, name: str, image: str) -> lis
     ]
 
 
-def run_pytest(workspace: Path, timeout_seconds: float, image: str = SANDBOX_IMAGE) -> TestRun:
+def run_pytest(
+    workspace: Path,
+    timeout_seconds: float,
+    image: str = SANDBOX_IMAGE,
+    guard: DependencyGuard | None = None,
+    run_id: str = "",
+) -> TestRun:
     """Run the workspace's ``tests/`` with pytest in a throwaway sandbox container.
 
     A run past ``timeout_seconds`` is killed and reported as ``timed_out`` (a
-    loaded failure, not a load error).
+    loaded failure, not a load error). With a ``guard``, a container Docker fails to
+    start is retried.
+
+    Raises:
+        SandboxUnavailableError: carrying the ``DependencyFailure``, if the guard gave up.
     """
     workspace = workspace.resolve()
     test_files = qa_test_files(workspace)
-    name = f"qa-pytest-{secrets.token_hex(6)}"
     started = time.monotonic()
-    with tempfile.TemporaryDirectory(prefix="qa-out-") as out:
+    with tempfile.TemporaryDirectory(prefix="qa-out-", dir=qa_output_root()) as out:
         out_dir = Path(out)
-        process = subprocess.Popen(
-            pytest_command(workspace, out_dir, name, image),
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        )
-        try:
-            stdout, stderr = process.communicate(timeout=timeout_seconds)
-            exit_code, timed_out = process.returncode, False
-        except subprocess.TimeoutExpired:
-            kill_container(name)
-            stdout, stderr = process.communicate()
-            exit_code, timed_out = None, True
+
+        def attempt() -> subprocess.CompletedProcess:
+            name = f"qa-pytest-{secrets.token_hex(6)}"
+            command = pytest_command(workspace, out_dir, name, image, run_id)
+            return run_container(command, name, timeout_seconds)
+
+        outcome = guarded_run(attempt, guard)
+        if isinstance(outcome, GuardFailure):
+            raise SandboxUnavailableError(
+                f"Sandbox unavailable for the test run: {outcome.failure['message']}",
+                outcome.failure,
+            )
         cases, xml_ok = _read_report(out_dir / "junit.xml", test_files)
-    output = (cap_output(stdout) + cap_output(stderr))[-OUTPUT_TAIL_CHARS:]
+    output = (cap_output(outcome.stdout) + cap_output(outcome.stderr))[-OUTPUT_TAIL_CHARS:]
     duration = round(time.monotonic() - started, 3)
+    exit_code, timed_out = outcome.returncode, outcome.returncode is None
     return summarise(cases, exit_code, timed_out, xml_ok, test_files, output, duration)
+
+
+def qa_output_root() -> str | None:
+    """Where QA's JUnit folder is created: ``QA_OUTPUT_ROOT``, or the system temp dir.
+
+    Under Compose the agent asks the host engine to mount this folder into the sandbox,
+    so it must be a host path (research R16).
+    """
+    root = os.environ.get("QA_OUTPUT_ROOT")
+    if not root:
+        return None
+    Path(root).mkdir(parents=True, exist_ok=True)
+    return root
 
 
 def qa_test_files(workspace: Path) -> list[str]:

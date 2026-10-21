@@ -78,7 +78,8 @@ tracing are each written once:
    containers labelled per run with start-up cleanup, the new end reasons
    `dependency_unavailable`, `budget_exceeded` and `interrupted`, and exit codes 0/1/2/3/130/143.
 7. **Deployment**: a root `Dockerfile` (pinned base, pinned Docker CLI, non-root, Chroma
-   embedding model baked in, no secrets) and a `docker-compose.yml` with `chroma`
+   embedding model baked in, no secrets; stages `app`, `test` with `coverage` for the
+   in-image suite, and `runtime` as the deployed default) and a `docker-compose.yml` with `chroma`
    (`chromadb/chroma:1.5.9`, pinned by digest, heartbeat health check) and `agent`
    (`depends_on: service_healthy`, the host Docker socket as a documented trust
    exception, the workspace mounted at the same absolute path so that sandbox bind mounts
@@ -148,17 +149,21 @@ no tracing network calls. Coder history stays append-only (preserved thinking on
 | I. Logic in 3+ places is extracted | PASS (improves) | The five copies of "create → refusal check → join text → `json.loads`" become `ModelCaller` + `parse_reply`. |
 | II. No speculative features | PASS | Each new part maps to a directive or an FR. There is no read-through response cache (the cache is used only for degradation) and no pluggable tracer interface (LangSmith only). |
 | II. Classes only for state or domain concepts | PASS | `ModelCaller`, `CircuitBreaker`, `ResponseCache`, `RunBudget`, `UsageLedger` and `EventLog` all hold state. Everything else is functions and `TypedDict`s. |
-| II. No hidden global mutable state | PASS | Guards, budget, ledger, event log and tracer are built once per run in `run_team` (a `RunServices` bundle) and passed explicitly to the agents. There is no module-level breaker registry. |
+| II. No hidden global mutable state | PASS | Guards, budget, ledger, event log and tracer are built once per run in `run_team` (a `RunServices` bundle, `orchestration/services.py`) and passed explicitly to the agents. There is no module-level breaker registry. |
 | II. Abstractions need 2+ uses | PASS | `DependencyGuard` has four concrete dependencies: anthropic, mcp, sandbox, chroma. The validator has more than 10 reply types. |
-| III. New third-party dependency justified | PASS (amended) | `langsmith` (runtime, already transitive) and `coverage` (dev-only) are justified in [Complexity Tracking](#complexity-tracking) and approved by constitution **1.3.0** (amended 2026-10-19), with `langsmith` limited to `trace`, `tracing_context`, `RunTree` and `Client`. |
+| III. New third-party dependency justified | PASS (amended) | `langsmith` (runtime, already transitive) and `coverage` (dev-only) are justified in [Complexity Tracking](#complexity-tracking) and approved by constitution **1.3.0** (amended 2026-10-19), with `langsmith` limited to `trace`, `tracing_context`, `RunTree` and `Client`. Constitution **1.4.0** (2026-10-20) approves the existing test-only `httpx2` import used to build real `anthropic` errors in tests and `ScriptedClaude`. **1.4.1** lists the existing `pysqlite3-binary` in the baseline. |
 | III. LangGraph core API only; no checkpointers | PASS | Checkpoint and resume are project code on the standard library (research R13). The graph gains a `resume` routing node and still uses only `StateGraph`/`START`/`END`. |
 | III. No overlapping dependencies | PASS | No Pydantic models are added: validation stays on `TypedDict` (R10). LangSmith is the only tracer, with no OpenTelemetry exporter. |
 | Python standards: 3.12, PEP 8/257, env-only secrets, `__main__` guards | PASS | Secrets reach the agent container only at run time (`env_file`/`-e`). The image and checkpoints hold none. New CLIs (`orchestration.health`) have `__main__` guards. |
-| Tests on the standard library | PASS | Tests stay `unittest`. `coverage` only runs them. |
+| Tests on the standard library | PASS | Tests stay `unittest`. `coverage` only runs them. The one non-stdlib test import is `httpx2`, approved test-only by constitution 1.4.0. |
 | Workflow: tests with every change; small commits | PASS | Every module comes with its tests (contract [test-suite.md](contracts/test-suite.md)). Phases are ordered so each one is a separable commit. |
 
 **Gate result (pre-research)**: PASS. The Principle III amendment it depended on has
 landed as constitution 1.3.0 (2026-10-19).
+
+**Re-check after `/speckit-analyze` (2026-10-20)**: PASS against constitution 1.4.1.
+Finding D1 (the unapproved `httpx2` test import) is resolved by 1.4.0, and finding D2
+(`pysqlite3-binary` missing from the baseline list) by 1.4.1.
 
 **Re-check after Phase 1 design**: PASS. The design artifacts add no dependency beyond
 the two above. The Docker CLI binary and the Chroma server image are deployment
@@ -219,7 +224,8 @@ orchestration/
 ├── validation.py        # validate(value, TypedDict) -> list[str]
 ├── checkpoint.py        # save/load checkpoint, workspace snapshot/restore, run lock
 ├── health.py            # python -m orchestration.health
-└── team.py              # RunServices, resume router, signals, exit codes, cost report
+├── services.py          # RunServices: the per-run bundle passed to the agents
+└── team.py              # resume router, signals, exit codes, cost report
 messaging/
 └── endpoints.py         # trace headers in/out of A2A message metadata
 tools/
@@ -238,7 +244,11 @@ tests/
 ├── (existing unit tests, made fully mocked)
 ├── test_validation.py, test_resilience.py, test_tracing.py, test_cost.py,
 │   test_events.py, test_redaction.py, test_checkpoint.py, test_health.py,
-│   test_lifecycle.py, test_model_caller.py
+│   test_lifecycle.py, test_model_caller.py, test_scripted_claude.py,
+│   test_response_cache.py, test_tool_resilience.py, test_never_crashes.py,
+│   test_resume.py, test_injected_failures.py, test_secret_sweep.py,
+│   test_prompt_caching.py, test_model_defaults.py, test_coverage_of_end_reasons.py
+├── fakes/slow_team_main.py   # entry module for the SIGTERM test
 ├── fakes/scripted_claude.py  # scripted model for integration and e2e
 ├── fixtures/e2e/             # supplied requirement + pytest fixture
 ├── integration/test_pm_coder.py, test_coder_qa.py, test_coder_sandbox.py,
@@ -273,12 +283,15 @@ table records what changed and why:
 
 ## Implementation phases (order for `/speckit-tasks`)
 
-Each phase is a separable commit and leaves the suite green.
+Each phase is a separable commit and leaves the suite green. `scripts/test.sh` reports
+coverage from Phase 1 on but gates at 85% only from the test-suite phase (T091), so it
+can serve as the pre-merge check at every phase.
 
 0. **Governance** (done 2026-10-19): constitution amendment 1.3.0 (langsmith, coverage),
    spec deltas D1–D10 applied, baseline benchmark run *before* any model or caching
    change (SC-205), recorded under [Baseline](#baseline-benchmark-pre-feature).
-1. **Foundations**: `orchestration/validation.py`, `observability/redaction.py`,
+1. **Foundations**: `orchestration/validation.py`, `observability/redaction.py` (so that
+   US1's checkpoints and run records are redacted from the start),
    `cost/pricing.py` + `prices.json`, new `TypedDict`s and end reasons in `state.py`.
 2. **Resilience**: classifier, retry, circuit breaker, response cache, `DependencyGuard`.
 3. **ModelCaller**: migrate the PM, then the Coder, then QA onto it. This brings reply
@@ -306,7 +319,20 @@ Each phase is a separable commit and leaves the suite green.
 | `langsmith` declared as a runtime dependency (Principle III baseline amendment) | Directive 1 names LangSmith. It is the SDK for that service. MIT licensed and maintained by LangChain Inc. It is already installed transitively by the approved `langgraph` (via `langchain-core`), so declaring it adds no new package. Its use is limited to `trace`, `tracing_context`, `RunTree` header propagation and `Client(hide_inputs=, hide_outputs=, hide_metadata=)`. | Raw HTTP to the LangSmith REST API means re-implementing batching, run-tree ordering and header propagation that the SDK already ships. `langsmith.wrappers.wrap_anthropic` is rejected: it bypasses our retry, cache and redaction layer and can't attach the required agent metadata. OpenTelemetry adds several new packages. |
 | `coverage` as a dev-only dependency | FR-237 requires statement coverage with an 85% gate. The standard library has no statement-coverage tool (`trace` reports line counts but has no branch-free statement report or threshold, and it is unmaintained for this use). Apache 2.0, actively maintained. It is never imported by project code or tests. | Writing a `sys.settrace` coverage tool would be fragile and slow. Dropping the gate would violate FR-237. |
 | A `resume` routing node at the graph's START | FR-213a requires continuing from the stage after the checkpoint. | A LangGraph checkpointer would need a further amendment and stores LangGraph-internal state we can't redact or version. Re-running the whole graph and skipping stages inside every node spreads the resume logic across 8 nodes. |
+| Three functions slightly over the ~40-line guideline (Principle I), found by the T096 re-check | `initial_team_state` (42 lines) is one flat `TeamState(...)` literal listing every field with its start value. `CoderAgent.run` (47) and `QAAgent._resolve_disputes` (42) came from 002 at that length and change little here. | Splitting a data literal scatters a run's start state over several functions. The other two read top to bottom as one step each, and 003 didn't touch their logic. Seven other functions that 003 wrote or grew past 40 lines were split instead (`_execute`, `qa_node`, `resume_team`, `build_team_graph`, `_finalize`, `exec_python`, the benchmark's `main`). |
 | Host Docker socket mounted into the agent container (trust exception, FR-233) | The sandbox must be a sibling container started by the host engine. | Docker-in-Docker needs `--privileged`, which is strictly worse. Rootless remote engines are out of scope. Sandboxes still never get the socket. |
+
+**Re-check against the delivered code (T096, 2026-10-20)**: PASS, with the three
+function lengths justified in Complexity Tracking. The re-check found:
+
+- no bare `except`;
+- no module-level mutable state in `resilience/`, `observability/` or `cost/` (only
+  compiled patterns, paths and a `TypeVar`);
+- `langsmith` imported only as `Client` and `RunTree`;
+- no LangChain or `coverage` import;
+- `httpx2` imported only under `tests/`, and `pysqlite3` only in `agents/memory.py`;
+- no failure-injection switch in production code or settings;
+- every requirement pinned.
 
 ## Earlier baseline run (before the QA fix; superseded)
 
@@ -458,3 +484,35 @@ run couldn't serve as the baseline.
   ($0.824) is reported alongside.
 - SC-205a: the median duration must not exceed **223 s**.
 - The quality bar returns to 002's SC-102: **≥ 8/10**.
+
+## Quickstart validation
+
+Recorded during `/speckit-implement` on 2026-10-20, on a host with **no Docker** (so
+every Docker-gated step is still open) and Python 3.12.
+
+**Quickstart §1, the suite (T091, T092)**:
+
+| Check | Result |
+|---|---|
+| `scripts/test.sh` (coverage gate 85%) | exit 0: 519 tests, 48 skipped, **96%** statement coverage |
+| Duration | 1 min 16 s (target < 5 min, SC-209) |
+| No API key, proxy pointed at a closed port | exit 0 |
+| No network at all (`unshare -rn scripts/test.sh`) | exit 0, same counts |
+| Every skip states its reason | yes: 41 "Docker is not available", 6 "Docker Compose is not available", 1 "RUN_LIVE_E2E is not set" |
+| Same results inside the image (`test` stage) | **not run**: needs Docker |
+
+**Overhead (SC-210, SC-212)**: five scripted team runs (real agents, every model call
+held 200 ms, two QA iterations), measured from the run's own events:
+
+| Measure | Result | Limit |
+|---|---|---|
+| Median run | 4,467 ms | |
+| Guard bookkeeping, Σ(`duration_ms` − `operation_ms`) of model and tool calls | at most 8 ms (0.18%) | 5% |
+| Checkpoint saves, Σ `checkpoint_saved.duration_ms` | at most 105 ms (2.35%) | 5% |
+
+Live model calls take seconds rather than 200 ms, so live shares will be smaller still.
+The live benchmark (T073) will confirm SC-205a.
+
+**SC-201**: with 1 model call in 5 failing temporarily, 96 of 100 seeded scripted runs
+reach the undisturbed end reason (target 95%; `tests/test_injected_failures.py`).
+Seeds 0–19 alone give 18/20. Twenty runs are too few to measure a rate near 96%.

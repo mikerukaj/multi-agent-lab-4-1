@@ -50,14 +50,18 @@ def dispatch_tool(
     timeout_seconds: float,
     image: str = SANDBOX_IMAGE,
     file_tools=None,
+    guard=None,
+    run_id: str = "",
 ) -> tuple[str, bool, ExecutionResult | None]:
     """Run the named tool and describe the outcome for the model.
 
     Returns the text for the ``tool_result`` block, whether it is an error,
     and the ``ExecutionResult`` when ``exec_python`` ran. Tool failures come
     back as error text so the model can recover; they are never raised.
-    ``McpUnavailableError`` from ``file_tools`` is not a tool failure and
-    propagates to the caller.
+    ``McpUnavailableError`` from an unguarded ``file_tools`` is not a tool failure
+    and propagates to the caller. ``guard`` (the sandbox's) and ``run_id`` are
+    passed to ``exec_python``; a sandbox it gives up on comes back as the
+    ``DependencyFailure`` JSON with ``is_error`` set, so the session goes on.
     """
     if name in FILE_TOOL_NAMES:
         if file_tools is None:
@@ -66,7 +70,11 @@ def dispatch_tool(
         return (*file_tools.call(name, arguments), None)
     try:
         if name == "exec_python":
-            result = exec_python(workspace, tool_input["path"], timeout_seconds, image)
+            result = exec_python(
+                workspace, tool_input["path"], timeout_seconds, image, guard, run_id
+            )
+            if result.failure:
+                return json.dumps(result.failure), True, None
             return json.dumps(result.to_dict()), False, result
     except (ValueError, FileNotFoundError) as error:
         return str(error), True, None

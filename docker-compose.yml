@@ -1,0 +1,56 @@
+# The team as two services: Chroma (the Coder's long-term memory, shared safely by
+# concurrent runs) and the one-shot agent (specs/003-production-hardening/contracts/
+# deployment.md). From a clean state:
+#
+#   docker compose up --build --abort-on-container-exit --exit-code-from agent
+#
+# runs TEAM_REQUIREMENT once and exits with the agent's exit code.
+
+services:
+  chroma:
+    image: chromadb/chroma:1.5.9@sha256:1e0b73a187a28757c572acba508c46f48c9e8b0acaf5c20e6d95cdedce1acdf6
+    volumes:
+      - chroma-data:/data
+    environment:
+      - ANONYMIZED_TELEMETRY=FALSE
+    healthcheck:
+      # The image has bash but no curl, wget or python3 (research R16).
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/8000 && printf 'GET /api/v2/heartbeat HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q nanosecond <&3"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    # No ports: Chroma is reachable only on the Compose network.
+
+  agent:
+    build:
+      context: .
+      target: runtime
+    image: multi-agent-lab:local
+    depends_on:
+      chroma:
+        condition: service_healthy
+    env_file:
+      - .env  # Run-time secrets only (ANTHROPIC_API_KEY, LANGSMITH_*).
+    environment:
+      CHROMA_HOST: chroma
+      CHROMA_PORT: "8000"
+      CODER_WORKSPACE: ${PWD}/workspace
+      QA_OUTPUT_ROOT: ${PWD}/workspace/.qa-out
+      COST_REPORT_DIR: /app/docs/cost_reports
+    user: "${HOST_UID:?set HOST_UID in .env}:${HOST_GID:?set HOST_GID in .env}"
+    group_add:
+      - "${DOCKER_GID:?set DOCKER_GID in .env}"
+    volumes:
+      # TRUST EXCEPTION (FR-233): the agent controls the host's Docker engine, which is
+      # equivalent to root on the host. Only this service gets the socket.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # The same absolute path inside and out, so sandbox bind mounts resolve on the host.
+      - ${PWD}/workspace:${PWD}/workspace
+      - ${PWD}/docs/cost_reports:/app/docs/cost_reports
+      - ${PWD}/benchmarks/results:/app/benchmarks/results
+      - ${PWD}/.cache:/app/.cache
+    command: ["${TEAM_REQUIREMENT:-A command-line tool that converts temperatures between Celsius and Fahrenheit}"]
+
+volumes:
+  chroma-data:

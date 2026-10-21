@@ -1,0 +1,23 @@
+Build a small inventory tracker in Python, as a library and a command-line tool.
+
+The library is a module inventory.py with three functions. An inventory is a dict that
+maps item names to whole-number quantities.
+
+- add_item(inventory: dict[str, int], name: str, quantity: int) -> dict[str, int]
+  returns a new inventory with quantity added to name (a new name starts at 0). It
+  raises ValueError if quantity is not positive. The inventory passed in is not changed.
+- remove_item(inventory: dict[str, int], name: str, quantity: int) -> dict[str, int]
+  returns a new inventory with quantity taken from name. An item whose quantity reaches
+  0 is removed. It raises ValueError if name is not in the inventory, if quantity is
+  more than the stock, or if quantity is not positive. The inventory passed in is not
+  changed.
+- report(inventory: dict[str, int]) -> str returns one line per item, "name: quantity",
+  sorted by name and joined with newlines; an empty inventory gives an empty string.
+
+The command-line tool is main.py. It takes one argument, the path of a commands file,
+and runs its commands in order on an inventory that starts empty. Each line is one
+command: "add NAME QTY", "remove NAME QTY" or "report" (which prints the report). Blank
+lines are skipped. On any bad input (a missing argument, an unknown command, a wrong
+number of words, a quantity that is not a whole number, or a ValueError from the
+library) it prints one line starting with "error:" to standard error and exits with
+status 1. Otherwise it exits with status 0.

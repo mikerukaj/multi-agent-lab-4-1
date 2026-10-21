@@ -11,6 +11,7 @@ is raised.
 
 import asyncio
 import concurrent.futures
+import json
 import os
 import sys
 import tempfile
@@ -21,13 +22,26 @@ from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.types import CallToolResult
 
+from resilience.circuit import DependencyGuard, GuardFailure
+from tools.mcp_errors import McpStartupError, McpUnavailableError
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_TOOLS = {"read_file", "write_file"}
 SETUP_TIMEOUT_SECONDS = 15.0
 
 
-class McpUnavailableError(RuntimeError):
-    """Raised when the MCP file-tool server cannot be started or reached."""
+def failure_in(text: str) -> dict | None:
+    """The ``DependencyFailure`` a degraded tool result carries, or ``None``.
+
+    A guarded call that gives up returns ``(json.dumps(failure), True)``; callers that
+    must tell that apart from an ordinary tool error (QA) use this.
+    """
+    try:
+        data = json.loads(text)
+    except (TypeError, ValueError):
+        return None
+    keys = {"dependency", "kind", "circuit", "attempts"}
+    return data if isinstance(data, dict) and keys <= data.keys() else None
 
 
 class McpFileTools:
@@ -35,6 +49,9 @@ class McpFileTools:
 
     Use it as a context manager. ``protect`` lists workspace-relative folders
     that ``write_file`` refuses (the Coder's sessions pass ``("tests", ".qa")``).
+    With a ``guard``, a server that dies mid-session is restarted for the same
+    workspace and protections and the call repeated; each restart is one retry
+    (FR-206), and a call the guard gives up on returns ``(failure JSON, True)``.
     """
 
     def __init__(
@@ -42,10 +59,14 @@ class McpFileTools:
         workspace: Path,
         protect: tuple[str, ...] = (),
         call_timeout_seconds: float = 30.0,
+        guard: DependencyGuard | None = None,
     ) -> None:
         self.workspace = Path(workspace).resolve()
         self.protect = tuple(protect)
         self.call_timeout_seconds = call_timeout_seconds
+        self.guard = guard
+        self.restarts = 0
+        self._dead = False
         self._ready = threading.Event()
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -64,6 +85,13 @@ class McpFileTools:
         return StdioServerParameters(command=sys.executable, args=args, env=env, cwd=REPO_ROOT)
 
     def __enter__(self) -> "McpFileTools":
+        self._start()
+        return self
+
+    def _start(self) -> None:
+        """Start the server process and its session; raise if it is unusable."""
+        self._ready = threading.Event()
+        self._error, self._tools, self._session = None, [], None
         self._errlog = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
         self._thread = threading.Thread(target=self._run_loop, name="mcp-file-tools", daemon=True)
         self._thread.start()
@@ -75,14 +103,13 @@ class McpFileTools:
         if self._error is not None:
             reason = self._server_stderr() or f"{type(self._error).__name__}: {self._error}"
             self.close()
-            raise McpUnavailableError(f"MCP file-tool server unavailable: {reason}")
+            raise McpStartupError(f"MCP file-tool server unavailable: {reason}")
         names = {tool.name for tool in self._tools}
         if names != EXPECTED_TOOLS:
             self.close()
             raise McpUnavailableError(
                 f"MCP file-tool server offers {sorted(names)}, not {sorted(EXPECTED_TOOLS)}"
             )
-        return self
 
     def __exit__(self, *exc) -> None:
         self.close()
@@ -103,9 +130,34 @@ class McpFileTools:
         """Call one tool and return ``(text, is_error)``.
 
         Tool-level failures (missing file, refused path) come back as
-        ``(text, True)``. Raises ``McpUnavailableError`` when the session is closed,
-        the server answers with a protocol error, or the call times out.
+        ``(text, True)``. Without a guard, raises ``McpUnavailableError`` when the
+        session is closed, the server answers with a protocol error, or the call times
+        out. With one, those are retried (restarting the server) and a call that still
+        fails returns ``(json.dumps(failure), True)``.
         """
+        if self.guard is None:
+            return self._call_once(name, arguments)
+        outcome = self.guard.call(lambda: self._attempt(name, arguments))
+        if isinstance(outcome, GuardFailure):
+            return json.dumps(outcome.failure), True
+        return outcome
+
+    def _attempt(self, name: str, arguments: dict) -> tuple[str, bool]:
+        """One guarded attempt: restart a server that died, then make the call."""
+        if self._dead:
+            self.close()
+            self._start()
+            self.restarts += 1
+            self.guard.emit("restart", "warning", outcome="restarted",
+                            message=f"MCP file-tool server restarted ({self.restarts})")
+            self._dead = False
+        try:
+            return self._call_once(name, arguments)
+        except McpUnavailableError:
+            self._dead = True
+            raise
+
+    def _call_once(self, name: str, arguments: dict) -> tuple[str, bool]:
         if self._session is None or self._loop is None or self._loop.is_closed():
             raise McpUnavailableError("MCP file-tool session is closed")
         future = asyncio.run_coroutine_threadsafe(

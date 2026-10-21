@@ -13,25 +13,48 @@ import ast
 import json
 import os
 import shutil
+import typing
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path, PurePosixPath
 
 import anthropic
 
-from agents.llm import EFFORT_LEVELS, MAX_TOKENS, add_tokens, refusal_message, with_fallbacks
+from agents.llm import (
+    EFFORT_LEVELS,
+    MAX_TOKENS,
+    SMALL_MODEL,
+    check_model_settings,
+    fallbacks_from_env,
+    resolve_fallbacks,
+    NOT_JSON,
+    ModelCaller,
+    add_usage,
+    failure_message,
+    stable_blocks,
+    system_blocks,
+    with_fallbacks,
+    zero_usage,
+)
+from orchestration.services import RunServices
 from orchestration.state import (
+    ConstitutionRule,
+    DependencyFailure,
     Dispute,
     FinalReportRequest,
     QAContext,
+    QADisputeReply,
     QAFinding,
     QAReport,
+    QAReviewReply,
+    QATestFilesReply,
     TestChange,
     TestRun,
     TokenUsage,
 )
-from tools.mcp_client import McpFileTools, McpUnavailableError
-from tools.python_exec import SANDBOX_IMAGE, ensure_sandbox
+from tools.mcp_client import McpFileTools, McpUnavailableError, failure_in
+from tools.python_exec import SANDBOX_IMAGE, SandboxUnavailableError, ensure_sandbox
+from orchestration.validation import first_problems
 from tools.test_runner import run_pytest
 
 MAX_REPAIR_ATTEMPTS = 3
@@ -46,22 +69,10 @@ character from the specification above, put every test file under tests/ with a 
 name, and keep the reply short enough to finish: write fewer or shorter test files if \
 needed."""
 REPORT_PATH = ".qa/report.md"
+PARTIAL_END_REASONS = ("interrupted", "budget_exceeded", "dependency_unavailable")
+"""Runs that stopped before QA could finish: their report says it is partial."""
 TIMEOUT_TEST_ID = "<timeout>"
-CONSTITUTION_RULES = (
-    "intent-revealing-names",
-    "function-does-one-thing",
-    "public-api-type-hints-and-docstrings",
-    "comments-explain-why",
-    "no-commented-out-code",
-    "explicit-error-handling",
-    "extract-triplicated-logic",
-    "python-3.12-only",
-    "pep8-pep257",
-    "import-grouping",
-    "no-wildcard-imports",
-    "no-hardcoded-secrets",
-    "main-guard",
-)
+CONSTITUTION_RULES = typing.get_args(ConstitutionRule)
 
 TEST_FILE_SCHEMA = {
     "type": "object",
@@ -167,7 +178,15 @@ leave its rule empty.
 
 
 class QAStepError(Exception):
-    """One step of a QA iteration could not finish; the message says why."""
+    """One step of a QA iteration could not finish; the message says why.
+
+    ``failure`` is set when the step failed because a dependency (the model service,
+    MCP or the sandbox) could not be used (FR-209c).
+    """
+
+    def __init__(self, message: str, failure: DependencyFailure | None = None) -> None:
+        super().__init__(message)
+        self.failure = failure
 
 
 class QAReplyRejected(QAStepError):
@@ -178,12 +197,17 @@ class QAReplyRejected(QAStepError):
 class QAConfig:
     """Settings for the QA Agent; ``from_env`` applies ``QA_*`` overrides."""
 
-    model: str = "claude-sonnet-5-5"
+    model: str = SMALL_MODEL
     effort: str = "high"
     test_timeout_seconds: float = 60.0
     repair_attempts: int = 2
-    use_fallbacks: bool = True
+    use_fallbacks: bool | None = None
+    """``None`` means on if the model supports server-side refusal fallback."""
     sandbox_image: str = SANDBOX_IMAGE
+
+    warnings: list[str] = field(default_factory=list, init=False, repr=False,
+                                compare=False)
+    """Settings the capability table could not check (an unknown model)."""
 
     def __post_init__(self) -> None:
         if not self.model or not self.sandbox_image:
@@ -194,6 +218,8 @@ class QAConfig:
             raise ValueError("test_timeout_seconds must be greater than 0")
         if not 0 <= self.repair_attempts <= MAX_REPAIR_ATTEMPTS:
             raise ValueError(f"repair_attempts must be between 0 and {MAX_REPAIR_ATTEMPTS}")
+        self.use_fallbacks = resolve_fallbacks(self.model, self.use_fallbacks)
+        self.warnings = check_model_settings("qa", self.model, self.effort, self.use_fallbacks)
 
     @classmethod
     def from_env(cls) -> "QAConfig":
@@ -209,7 +235,7 @@ class QAConfig:
             effort=env.get("QA_EFFORT", defaults.effort),
             test_timeout_seconds=float(env.get("QA_TEST_TIMEOUT", defaults.test_timeout_seconds)),
             repair_attempts=int(env.get("QA_REPAIR_ATTEMPTS", defaults.repair_attempts)),
-            use_fallbacks=env.get("QA_USE_FALLBACKS", "true").lower() not in ("0", "false", "no"),
+            use_fallbacks=fallbacks_from_env(env.get("QA_USE_FALLBACKS")),
             sandbox_image=env.get("CODER_SANDBOX_IMAGE", defaults.sandbox_image),
         )
 
@@ -224,8 +250,9 @@ class QAIterationResult:
     test_changes: list[TestChange] = field(default_factory=list)
     test_suite: dict[str, str] = field(default_factory=dict)
     verdict: str = "fix_needed"
-    usage: TokenUsage = field(default_factory=lambda: TokenUsage(input_tokens=0, output_tokens=0))
+    usage: TokenUsage = field(default_factory=zero_usage)
     error: str | None = None
+    failure: DependencyFailure | None = None
 
     def to_dict(self) -> dict:
         """Return a plain-JSON copy (the ``qa-iteration`` artifact's data)."""
@@ -241,7 +268,7 @@ class _Turn:
     workspace: Path
     test_suite: dict[str, str]
     test_changes: list[TestChange] = field(default_factory=list)
-    usage: TokenUsage = field(default_factory=lambda: TokenUsage(input_tokens=0, output_tokens=0))
+    usage: TokenUsage = field(default_factory=zero_usage)
 
 
 def empty_test_run() -> TestRun:
@@ -261,13 +288,26 @@ class QAAgent:
         client=None,
         run_tests=run_pytest,
         file_tools=McpFileTools,
+        services: RunServices | None = None,
     ) -> None:
         self.config = config or QAConfig.from_env()
         if run_tests is run_pytest:
             ensure_sandbox(self.config.sandbox_image)
-        self._client = client or anthropic.Anthropic(max_retries=3)
+        # The SDK's own retries are off: the run's dependency guard retries (research R3).
+        self._client = client or anthropic.Anthropic(max_retries=0)
+        self._services = services or RunServices.create()
+        self._caller = ModelCaller("qa", self._client, self._services)
         self._run_tests = run_tests
         self._file_tools = file_tools
+
+    def attach(self, services: RunServices) -> None:
+        """Use ``services`` (the run's shared helpers) for every later call."""
+        self._services = services
+        self._caller = ModelCaller("qa", self._client, services)
+
+    def _open_files(self, workspace: Path):
+        """An MCP file-tool session for ``workspace``, guarded by the run's ``mcp`` breaker."""
+        return self._file_tools(workspace, guard=self._services.guard("mcp", str(workspace)))
 
     def run_iteration(self, context: QAContext) -> QAIterationResult:
         """Run one QA iteration on the program in ``context["workspace"]``.
@@ -277,12 +317,12 @@ class QAAgent:
         """
         workspace = Path(context["workspace"])
         try:
-            with self._file_tools(workspace) as files:
+            with self._open_files(workspace) as files:
                 turn = _Turn(context, files, workspace, dict(context["test_suite"]))
                 try:
                     return self._iterate(turn)
                 except QAStepError as error:
-                    return self._failed(turn, str(error))
+                    return self._failed(turn, str(error), error.failure)
         except McpUnavailableError as error:
             return QAIterationResult(
                 test_run=empty_test_run(), test_suite=dict(context["test_suite"]),
@@ -290,13 +330,16 @@ class QAAgent:
             )
 
     def final_report(self, request: FinalReportRequest) -> QAReport:
-        """Summarise the run and write ``.qa/report.md`` through MCP (no model call)."""
+        """Summarise the run and write ``.qa/report.md`` through MCP (no model call).
+
+        The session is not guarded: the report is the run's last, quick write, and it
+        must be written even when the run is stopping (the guard refuses calls then).
+        """
         report = build_report(request)
+        content = self._services.redactor.redact(render_report(report))  # FR-219.
         try:
             with self._file_tools(Path(request["workspace"])) as files:
-                _, is_error = files.call(
-                    "write_file", {"path": REPORT_PATH, "content": render_report(report)}
-                )
+                _, is_error = files.call("write_file", {"path": REPORT_PATH, "content": content})
         except McpUnavailableError:
             is_error = True
         return {**report, "report_path": "" if is_error else REPORT_PATH}
@@ -340,7 +383,7 @@ class QAAgent:
         """
         changed = []
         for path, content in sorted(turn.test_suite.items()):
-            text, is_error = turn.files.call("read_file", {"path": path})
+            text, is_error = self._file_call(turn, "read_file", {"path": path})
             if is_error or text != content:
                 self._write_file(turn, path, content)
                 turn.test_changes.append(
@@ -366,14 +409,14 @@ class QAAgent:
         if not disputed:
             return []
         findings = [f for f in context["previous_findings"] if f["finding_id"] in disputed]
-        user_text = "\n\n".join([
+        parts = [
             render_spec(context["spec"]),
             "The Coder disputes these findings:\n" + json.dumps(findings, indent=2),
             "The Coder's reasons:\n" + json.dumps(list(disputed.values()), indent=2),
             "Current test files:\n" + render_files(turn.test_suite),
             "Decide each dispute by checking the specification: keep the test or finding, "
             "or correct it. Return corrected test files for every 'correct' decision.",
-        ])
+        ]
         def check(data: dict) -> None:
             decided = {decision["finding_id"] for decision in data["decisions"]}
             unknown = sorted(decided - set(disputed))
@@ -384,7 +427,7 @@ class QAAgent:
                 )
             check_test_files(data["corrected_files"], context["spec"])
 
-        data = self._ask(turn, user_text, DISPUTES_FORMAT, check)
+        data = self._ask(turn, parts, DISPUTES_FORMAT, QADisputeReply, check)
         corrected = [d["finding_id"] for d in data["decisions"] if d["decision"] == "correct"]
         owner = corrected[0] if len(corrected) == 1 else None
         self._write_test_files(turn, data["corrected_files"], "dispute_correction", owner)
@@ -399,17 +442,20 @@ class QAAgent:
             for decision in data["decisions"]
         ]
 
-    def _failed(self, turn: _Turn, error: str) -> QAIterationResult:
+    def _failed(
+        self, turn: _Turn, error: str, failure: DependencyFailure | None = None
+    ) -> QAIterationResult:
         return QAIterationResult(
             test_run=empty_test_run(), test_changes=turn.test_changes,
-            test_suite=turn.test_suite, usage=turn.usage, error=error,
+            test_suite=turn.test_suite, usage=turn.usage, error=error, failure=failure,
         )
 
     def _read_sources(self, turn: _Turn) -> dict[str, str]:
         """Read every source file through MCP (the full code, used only after tests exist)."""
         sources = {}
         for path in turn.context["source_files"]:
-            text, is_error = turn.files.call("read_file", {"path": path})
+            text, is_error = self._file_call(turn, "read_file", {"path": path})
+            _raise_if_unavailable(text, is_error, f"Could not read {path}")
             if not is_error:
                 sources[path] = text
         return sources
@@ -423,7 +469,7 @@ class QAAgent:
 
     def _write_initial_tests(self, turn: _Turn, sources: dict[str, str]) -> None:
         python_sources = {path: text for path, text in sources.items() if path.endswith(".py")}
-        user_text = "\n\n".join([
+        parts = [
             render_spec(turn.context["spec"]),
             "The program's public interface (function bodies are hidden on purpose: take "
             "expected behavior only from the specification):\n"
@@ -432,13 +478,13 @@ class QAAgent:
             f"Main file: {turn.context['main_file'] or '(none)'}",
             "Write the full pytest suite for this specification under tests/. Cover every "
             "acceptance criterion and the edge cases the specification names.",
-        ])
+        ]
         def check(data: dict) -> None:
             if not data["test_files"]:
                 raise QAReplyRejected("Malformed QA reply: no test files were written")
             check_test_files(data["test_files"], turn.context["spec"])
 
-        data = self._ask(turn, user_text, WRITE_TESTS_FORMAT, check)
+        data = self._ask(turn, parts, WRITE_TESTS_FORMAT, QATestFilesReply, check)
         self._write_test_files(turn, data["test_files"], "initial")
 
     def _run_until_loaded(self, turn: _Turn) -> TestRun:
@@ -447,14 +493,14 @@ class QAAgent:
         for _ in range(self.config.repair_attempts):
             if test_run["loaded"]:
                 return test_run
-            user_text = "\n\n".join([
+            parts = [
                 render_spec(turn.context["spec"]),
-                "Your test suite did not load. pytest said:\n" + test_run["output"],
                 "Current test files:\n" + render_files(turn.test_suite),
-                "Return corrected versions of the test files that need changes.",
-            ])
+                "Your test suite did not load. pytest said:\n" + test_run["output"]
+                + "\n\nReturn corrected versions of the test files that need changes.",
+            ]
             data = self._ask(
-                turn, user_text, WRITE_TESTS_FORMAT,
+                turn, parts, WRITE_TESTS_FORMAT, QATestFilesReply,
                 lambda reply: check_test_files(reply["test_files"], turn.context["spec"]),
             )
             self._write_test_files(turn, data["test_files"], "load_repair")
@@ -465,8 +511,27 @@ class QAAgent:
         return test_run
 
     def _run(self, turn: _Turn) -> TestRun:
-        return self._run_tests(
-            turn.workspace, self.config.test_timeout_seconds, self.config.sandbox_image
+        guard = self._services.guard("sandbox", self.config.sandbox_image)
+        try:
+            return self._services.tool_call(
+                "pytest", {"workspace": str(turn.workspace)},
+                lambda: self._run_tests(
+                    turn.workspace, self.config.test_timeout_seconds,
+                    self.config.sandbox_image, guard=guard, run_id=self._services.run_id,
+                ),
+                describe=lambda run: {"exit_code": run["exit_code"],
+                                      "timed_out": run["timed_out"]},
+                event="sandbox_run", guard=guard,
+            )
+        except SandboxUnavailableError as error:
+            raise QAStepError(str(error), error.failure) from error
+
+    def _file_call(self, turn: _Turn, name: str, arguments: dict) -> tuple[str, bool]:
+        """One MCP file call, as a traced tool call."""
+        return self._services.tool_call(
+            name, {"path": arguments["path"]}, lambda: turn.files.call(name, arguments),
+            describe=lambda result: {"is_error": result[1]},
+            guard=getattr(turn.files, "guard", None),
         )
 
     def _review(
@@ -494,7 +559,8 @@ class QAAgent:
             "test covers, you may add a regression test that reproduces it."
         )
         return self._ask(
-            turn, "\n\n".join(parts), REVIEW_FORMAT, lambda data: check_review(data, context)
+            turn, parts, REVIEW_FORMAT, QAReviewReply,
+            lambda data: check_review(data, context),
         )
 
     def _write_regression_tests(self, turn: _Turn, review: dict) -> None:
@@ -520,75 +586,89 @@ class QAAgent:
                            criteria=list(test_file["criteria"]))
             )
 
-    @staticmethod
-    def _write_file(turn: _Turn, path: str, content: str) -> None:
+    def _write_file(self, turn: _Turn, path: str, content: str) -> None:
         """Write one test file through MCP and record it in QA's copy of the suite."""
-        text, is_error = turn.files.call("write_file", {"path": path, "content": content})
+        text, is_error = self._file_call(turn, "write_file", {"path": path, "content": content})
+        _raise_if_unavailable(text, is_error, f"Could not write {path}")
         if is_error:
             raise QAStepError(f"Could not write {path}: {text}")
         turn.test_suite[path] = content
 
     def _ask(
-        self, turn: _Turn, user_text: str, schema: dict,
+        self, turn: _Turn, parts: list[str], schema: dict, reply_type: type,
         check: Callable[[dict], None] | None = None,
     ) -> dict:
         """Get a structured reply that passes ``check``, asking once more after a rejection.
 
-        ``check`` must not write anything: it raises ``QAReplyRejected`` for a reply that
-        can't be used. A malformed or cut-off reply is rejected the same way. The second
-        request repeats ``user_text`` with the rejection reason. Refusals and failed model
-        calls are not retried.
+        The reply must first match ``reply_type`` (FR-219a). ``check`` must not write
+        anything: it raises ``QAReplyRejected`` for a reply that can't be used. A
+        malformed, invalid or cut-off reply is rejected the same way. The second request
+        repeats ``parts`` with the rejection reason. Refusals and failed model calls
+        are not retried.
 
         Raises:
             QAStepError: for a refusal or failed call, or the last rejection when the
                 corrected reply is rejected too.
         """
-        text = user_text
+        text = parts
         for attempt in range(1, REPLY_ATTEMPTS + 1):
             try:
-                data = self._ask_once(turn, text, schema)
+                data = self._ask_once(turn, text, schema, reply_type)
                 if check:
                     check(data)
                 return data
             except QAReplyRejected as rejection:
                 if attempt == REPLY_ATTEMPTS:
                     raise
-                text = f"{user_text}\n\n{CORRECTION_NOTE.format(reason=rejection)}"
+                note = CORRECTION_NOTE.format(reason=rejection)
+                text = [*parts[:-1], f"{parts[-1]}\n\n{note}"]
         raise AssertionError("unreachable: the loop returns or raises")
 
-    def _ask_once(self, turn: _Turn, user_text: str, schema: dict) -> dict:
-        """Make one structured-output model call and return its JSON."""
-        try:
-            response = self._client.beta.messages.create(**self._request(user_text, schema))
-        except anthropic.APIError as error:
-            raise QAStepError(f"Model call failed: {error}") from error
-        turn.usage = add_tokens(
-            turn.usage, response.usage.input_tokens, response.usage.output_tokens
-        )
-        if response.stop_reason == "refusal":
-            raise QAStepError(refusal_message(response.stop_details))
-        if response.stop_reason == "max_tokens":
+    def _ask_once(self, turn: _Turn, parts: list[str], schema: dict, reply_type: type) -> dict:
+        """Make one structured-output model call and return its validated JSON."""
+        reply = self._caller.call(self._request(parts, schema), reply_type)
+        if reply.failure:
+            raise QAStepError(failure_message(reply.failure), reply.failure)
+        turn.usage = add_usage(turn.usage, reply.usage)
+        if reply.refusal:
+            raise QAStepError(reply.refusal)
+        if reply.response.stop_reason == "max_tokens":
             raise QAReplyRejected(
                 "Malformed QA reply: the reply was cut off at the output limit before it "
                 "was complete"
             )
-        text = "".join(block.text for block in response.content if block.type == "text")
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError as error:
-            raise QAReplyRejected(f"Model output is not valid JSON: {text[:200]!r}") from error
+        if reply.problems and reply.problems[0].startswith(NOT_JSON):
+            raise QAReplyRejected(reply.problems[0])
+        if reply.problems:
+            raise QAReplyRejected(f"Malformed QA reply: {first_problems(reply.problems)}")
+        return reply.data
 
-    def _request(self, user_text: str, schema: dict) -> dict:
-        return build_qa_request(self.config, user_text, schema)
+    def _request(self, parts: list[str], schema: dict) -> dict:
+        return build_qa_request(self.config, parts, schema, self._services.prompt_cache_ttl)
 
 
-def build_qa_request(config: QAConfig, user_text: str, schema: dict) -> dict:
-    """Assemble the keyword arguments for one QA ``beta.messages.create`` call."""
+def _raise_if_unavailable(text: str, is_error: bool, what: str) -> None:
+    """Raise ``QAStepError`` with the failure when a file call could not reach MCP at all."""
+    failure = failure_in(text) if is_error else None
+    if failure:
+        raise QAStepError(f"{what}: MCP file tools unavailable ({failure['message']})", failure)
+
+
+def build_qa_request(
+    config: QAConfig, parts: list[str], schema: dict, cache_ttl: str = "off"
+) -> dict:
+    """Assemble the keyword arguments for one QA ``beta.messages.create`` call.
+
+    ``parts`` are the user message's sections: every part but the last repeats across
+    an iteration's calls (spec, sources, tests) and is cache-marked; the last is this
+    call's instruction (research R7).
+    """
     request = {
         "model": config.model,
         "max_tokens": MAX_TOKENS,
-        "system": QA_SYSTEM_PROMPT,
-        "messages": [{"role": "user", "content": user_text}],
+        "system": system_blocks(QA_SYSTEM_PROMPT, cache_ttl),
+        "messages": [{"role": "user", "content": stable_blocks(parts[:-1], parts[-1],
+                                                               cache_ttl)}],
         "thinking": {"type": "adaptive"},
         "output_config": {
             "effort": config.effort,
@@ -861,6 +941,9 @@ def render_report(report: QAReport) -> str:
         "",
         "## Unresolved findings",
     ]
+    if report["end_reason"] in PARTIAL_END_REASONS:
+        lines[1:1] = ["", f"This report is partial: the run ended {report['end_reason']} "
+                          "before QA finished its work."]
     lines += [_finding_line(finding) for finding in report["unresolved"]] or ["- None"]
     lines += ["", "## Advisory"]
     lines += [_finding_line(finding) for finding in report["advisory"]] or ["- None"]

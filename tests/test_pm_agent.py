@@ -4,6 +4,7 @@ import copy
 import json
 import os
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -22,20 +23,26 @@ from agents.pm_agent import (
     validate_tasks,
 )
 from orchestration.state import Task, TechnicalSpec
+from orchestration.team import initial_team_state, pm_node
+from tests.fakes import assert_no_live_dependencies
+from tests.fakes import scripted_claude as sc
 from tests.team_fakes import (
     FakePMClient,
     pm_response,
     regroup_payload,
     spec_payload,
     tasks_payload,
+    token_usage,
 )
 
 REQUIREMENT = "Build a temperature converter CLI"
 
 
-def api_error() -> anthropic.APIConnectionError:
+def api_error() -> anthropic.AuthenticationError:
+    """A permanent model error: reported at once, never retried (FR-205)."""
     request = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
-    return anthropic.APIConnectionError(request=request)
+    response = httpx2.Response(401, request=request)
+    return anthropic.AuthenticationError("invalid x-api-key", response=response, body=None)
 
 
 def make_pm(script: list, **config) -> tuple[PMAgent, FakePMClient]:
@@ -45,6 +52,10 @@ def make_pm(script: list, **config) -> tuple[PMAgent, FakePMClient]:
 
 def flat_criteria(tasks: list[dict]) -> list[str]:
     return [criterion for task in tasks for criterion in task["acceptance_criteria"]]
+
+
+def setUpModule() -> None:
+    assert_no_live_dependencies()
 
 
 class WriteSpecTests(unittest.TestCase):
@@ -60,7 +71,7 @@ class WriteSpecTests(unittest.TestCase):
         for task, original in zip(result.spec["tasks"], payload["tasks"]):
             self.assertEqual({**original, "task_id": task["task_id"]}, task)
         self.assertEqual(result.spec["assumptions"], payload["assumptions"])
-        self.assertEqual(result.usage, {"input_tokens": 100, "output_tokens": 50})
+        self.assertEqual(result.usage, token_usage(100, 50))
 
     def test_request_uses_structured_output_and_no_tools(self) -> None:
         pm, client = make_pm([pm_response(spec_payload(1))])
@@ -130,6 +141,59 @@ class WriteSpecTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             pm.write_spec("  ")
         self.assertEqual(client.requests, [])
+
+
+class DependencyFailureTests(unittest.TestCase):
+    """A model call that can't be served is reported with its structured failure."""
+
+    def test_temporary_failures_past_the_retries_mean_unavailable(self) -> None:
+        pm, client = make_pm([sc.overloaded_error()] * 4)
+        result = pm.write_spec(REQUIREMENT)
+        self.assertTrue(result.error.startswith("Model service unavailable: "), result.error)
+        self.assertEqual((result.failure["kind"], result.failure["attempts"]), ("temporary", 4))
+        self.assertEqual(len(client.requests), 4)
+
+    def test_a_permanent_failure_is_a_model_call_failure(self) -> None:
+        pm, client = make_pm([api_error()])
+        result = pm.write_spec(REQUIREMENT)
+        self.assertTrue(result.error.startswith("Model call failed: "), result.error)
+        self.assertEqual((result.failure["kind"], result.failure["attempts"]), ("permanent", 1))
+        self.assertEqual(len(client.requests), 1)
+
+
+class ReplyValidationTests(unittest.TestCase):
+    """A PM reply that does not match ``PMSpecReply`` is never used (FR-219a)."""
+
+    def assert_rejected(self, payload: dict, expected: str) -> None:
+        pm, _ = make_pm([pm_response(payload)])
+        result = pm.write_spec(REQUIREMENT)
+        self.assertIsNone(result.spec)
+        self.assertIsNone(result.rejection_reason)
+        self.assertTrue(result.error.startswith("Model output failed validation: "), result.error)
+        self.assertIn(expected, result.error)
+
+    def test_a_missing_key_is_rejected(self) -> None:
+        payload = spec_payload(2)
+        del payload["assumptions"]
+        self.assert_rejected(payload, "$: missing required key 'assumptions'")
+
+    def test_a_priority_outside_the_set_is_rejected(self) -> None:
+        payload = spec_payload(2)
+        payload["tasks"][1]["priority"] = "urgent"
+        self.assert_rejected(payload, "$.tasks[1].priority: 'urgent' is not one of")
+
+    def test_an_extra_key_is_rejected(self) -> None:
+        self.assert_rejected({**spec_payload(2), "confidence": 0.9}, "unknown key 'confidence'")
+
+    def test_the_team_ends_pm_error_and_creates_no_task(self) -> None:
+        payload = spec_payload(2)
+        payload["tasks"][0]["priority"] = "urgent"
+        pm, _ = make_pm([pm_response(payload)])
+        state = initial_team_state(REQUIREMENT, "run-1", Path("/tmp/unused"))
+        update = pm_node(state, pm)
+        self.assertEqual(update["status"], "error")
+        self.assertIn("Model output failed validation", update["error"])
+        self.assertNotIn("tasks", update)
 
 
 class ConsolidateTests(unittest.TestCase):

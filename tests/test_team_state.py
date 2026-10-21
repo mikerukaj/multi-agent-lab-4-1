@@ -16,7 +16,7 @@ from orchestration.state import (
     TaskProgress,
     TeamState,
 )
-from orchestration.team import initial_team_state
+from orchestration.team import add_usage, initial_team_state
 
 # Copied from contracts/task-handoff.schema.json ("required"); specs/ is not in git.
 HANDOFF_KEYS = {"task_id", "title", "description", "acceptance_criteria", "priority"}
@@ -42,6 +42,16 @@ TEAM_STATE_KEYS = {
     "qa_report",
     "end_reason",
     "a2a_log",
+    "agent_usage",
+    "cost_usd",
+    "budget_usd",
+    "failure",
+    "resume_from",
+    "resume_history",
+    "events_lost",
+    "trace_url",
+    "cost_report_path",
+    "summary",
 }
 
 TASK_PROGRESS_KEYS = {
@@ -313,6 +323,52 @@ class TeamStateSchemaTests(unittest.TestCase):
         self.assertIsNone(state["end_reason"])
         self.assertEqual(state["a2a_log"], [])
         self.assertEqual(initial_team_state("x", "r", Path("/w"))["max_iterations"], 5)
+
+    def test_initial_state_sets_the_hardening_defaults(self) -> None:
+        state = initial_team_state("Build it", "run-1", Path("/tmp/ws"))
+        self.assertEqual(
+            state["usage"],
+            {"input_tokens": 0, "output_tokens": 0,
+             "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
+        )
+        self.assertEqual(set(state["agent_usage"]), {"pm", "coder", "qa"})
+        for agent, usage in state["agent_usage"].items():
+            self.assertEqual(usage["agent"], agent)
+            self.assertEqual(usage["cost_usd"], 0.0)
+            self.assertEqual(usage["model_calls"], 0)
+        for key in ("cost_usd", "budget_usd", "failure", "resume_from", "trace_url",
+                    "cost_report_path", "summary"):
+            self.assertIsNone(state[key], key)
+        self.assertEqual(state["resume_history"], [])
+        self.assertFalse(state["events_lost"])
+
+    def test_initial_state_round_trips_through_json_unchanged(self) -> None:
+        state = initial_team_state("Build it", "run-1", Path("/tmp/ws"))
+        self.assertEqual(json.loads(json.dumps(state)), state)
+
+
+class AddUsageTests(unittest.TestCase):
+    def test_all_four_counters_are_summed(self) -> None:
+        total = add_usage(
+            {"input_tokens": 1, "output_tokens": 2,
+             "cache_creation_input_tokens": 3, "cache_read_input_tokens": 4},
+            {"input_tokens": 10, "output_tokens": 20,
+             "cache_creation_input_tokens": 30, "cache_read_input_tokens": 40},
+        )
+        self.assertEqual(
+            total,
+            {"input_tokens": 11, "output_tokens": 22,
+             "cache_creation_input_tokens": 33, "cache_read_input_tokens": 44},
+        )
+
+    def test_records_without_cache_keys_count_them_as_zero(self) -> None:
+        total = add_usage({"input_tokens": 5, "output_tokens": 6},
+                          {"input_tokens": 1, "output_tokens": 1, "cache_read_input_tokens": 7})
+        self.assertEqual(
+            total,
+            {"input_tokens": 6, "output_tokens": 7,
+             "cache_creation_input_tokens": 0, "cache_read_input_tokens": 7},
+        )
 
 
 if __name__ == "__main__":

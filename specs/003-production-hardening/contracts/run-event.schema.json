@@ -39,6 +39,7 @@
         },
         "cost_usd": {"type": ["number", "null"]},
         "duration_ms": {"type": "integer", "minimum": 0},
+        "operation_ms": {"type": "integer", "minimum": 0},
         "attempt": {"type": "integer", "minimum": 1},
         "delay_seconds": {"type": "number", "minimum": 0},
         "dependency": {"enum": ["anthropic", "mcp", "sandbox", "chroma", "a2a"]},

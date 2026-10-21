@@ -1,0 +1,6 @@
+[run]
+source = agents, orchestration, tools, messaging, observability, resilience, cost, benchmarks
+omit = tests/*
+
+[report]
+show_missing = true

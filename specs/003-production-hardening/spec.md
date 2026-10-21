@@ -55,7 +55,7 @@ Where they conflict with an earlier line of this spec, the directive wins, and t
 requirements below have been amended to match (plan.md, "Spec deltas" D1–D10):
 
 - Distributed tracing is **in scope**, through LangSmith. Every agent invocation is a
-  child span of one root trace per run, with the metadata `agent_name`, `token_count`,
+  child span of one root trace per run attempt, with the metadata `agent_name`, `token_count`,
   `tool_calls` and `duration_ms` (D1, FR-214a).
 - Every model call and every tool call is retried **at most 3 times** (not 4), with
   exponential backoff and jitter (D2, D3).
@@ -74,6 +74,20 @@ requirements below have been amended to match (plan.md, "Spec deltas" D1–D10):
   output must pass a supplied test fixture (D9, FR-235a–c).
 - **Every model output is validated** against the project's `TypedDict` schemas before it
   is acted on (D10, FR-219a).
+
+### Session 2026-10-20 (analysis follow-up)
+
+- A permanent failure (refusal, invalid request, bad credentials) keeps the agent's
+  existing end reason and exits 1. Only a temporary failure that ran out of retries, or a
+  call refused by an open circuit, ends `dependency_unavailable` and can be resumed
+  (FR-205, from `/speckit-analyze` finding I1).
+- File-tool server restarts follow D3: each restart is one retry under FR-204, at most 3
+  by default. US1 scenario 4 and the matching edge case were reworded to match (finding
+  I2).
+- QA's final report makes no model call, so it is always written, even at the budget cap.
+  FR-223, FR-225a and US3 no longer speak of its cost "fitting" (finding I5).
+- Tracing has one root per run *attempt*: a resumed run adds a root with the same run ID.
+  FR-214a and US2 scenario 6 now match SC-214 and the tracing contract (finding I6).
 
 ## User Scenarios & Testing *(mandatory)*
 
@@ -122,15 +136,16 @@ run, redoing only the stage that was interrupted.
    the existing end reason for that agent and a message naming the cause.
 4. **Given** the file-tool server process dies during a Coder or QA session, **When** the
    agent's next file call is made, **Then** a new server is started for the same workspace
-   with the same protections and the call is made again once.
+   with the same protections and the call is made again. Each restart counts as one retry
+   under FR-204, so there are at most 3 restarts for one call by default.
 5. **Given** a run is in progress, **When** the operator sends a stop signal, **Then** any
    running sandbox container is stopped, pending A2A requests are cancelled, a final record
    with end reason `interrupted` is written, and the process exits within 30 seconds with
    exit code 130 (interrupt) or 143 (terminate).
 6. **Given** a previous run was killed without warning, **When** the team next starts,
    **Then** sandbox containers left over from that run are found and removed.
-7. **Given** a run that ended `interrupted` or `dependency_unavailable`, or was killed
-   without a final record, **When** the operator resumes it by its run ID, **Then** its
+7. **Given** a run that ended `interrupted`, `dependency_unavailable` or `a2a_failed`, or
+   was killed without a final record, **When** the operator resumes it by its run ID, **Then** its
    workspace is restored to the state saved at the last completed stage, the run carries
    on from the next stage with the same run ID, settings, iteration count, token use and
    cost so far, and the completed stages are not repeated.
@@ -189,7 +204,8 @@ planted API key appears in no output.
 5. **Given** the operator sets a verbosity level, **When** the run proceeds, **Then** only
    events at or above that level are recorded, and the run summary is always written.
 6. **Given** tracing is turned on with LangSmith credentials, **When** a run ends,
-   **Then** LangSmith holds one root trace for the run. Every PM, Coder and QA
+   **Then** LangSmith holds one root trace for each run attempt (the first run and each
+   resume), all carrying the same run ID. Every PM, Coder and QA
    invocation, including the QA reviews and fix rounds that cross the A2A broker,
    appears as a span under that root, with `agent_name`, `token_count`, `tool_calls`
    and `duration_ms`.
@@ -202,7 +218,7 @@ planted API key appears in no output.
 
 The budget owner sees what each run cost, broken down by agent, and can set a spending cap
 per run. When a run reaches its cap, it stops at the next safe point, keeps everything
-built so far, asks QA for its final report if that fits in the remaining budget, and ends
+built so far, still has QA write its final report (which makes no model call), and ends
 with end reason `budget_exceeded`. The team also spends less for the same results: the
 PM keeps the larger model, because a bad plan wastes every later call, while the Coder
 and QA, which make most of a run's calls, move to a smaller, faster model. Context that
@@ -223,8 +239,8 @@ before and after the context-reuse changes.
    shows the cost per agent and the total, alongside the token counts it was computed
    from, including re-used context.
 2. **Given** a per-run budget, **When** the run's spend reaches it, **Then** no further
-   model call is started except the final report (only if it fits), and the run ends
-   `budget_exceeded` with its workspace and record intact.
+   model call is started, QA's final report (which makes no model call) is still
+   written, and the run ends `budget_exceeded` with its workspace and record intact.
 3. **Given** a model ID with no known price, **When** the run starts, **Then** the run
    still proceeds, the cost is reported as unknown for that agent with a warning, and a
    budget cap set for the run causes a refusal to start rather than an unenforceable cap.
@@ -337,8 +353,11 @@ any end reason or recovery path lacks a test.
   current call; the cap may be passed by at most that one call.
 - The event record's destination is not writable or the disk fills: the run continues,
   progress lines still reach stderr, and the run record states that events were lost.
-- The file-tool server dies again right after being restarted: the session fails with the
-  existing MCP-unavailable cause; restarts are not repeated indefinitely.
+- The file-tool server keeps dying after each restart: restarts stop once the call's retry
+  limit is used up (FR-204, FR-206; 3 by default), and are never repeated indefinitely.
+  The call then returns the structured error from FR-209c naming the file-tool server,
+  the attempts made and the circuit state, and the agent handles it on its existing
+  tool-error path.
 - Two or more runs use the Coder's long-term memory store at the same time: all of them
   proceed; each sees lessons that were fully written before its read, never a partial
   one, and no write is lost (FR-230a).
@@ -400,7 +419,11 @@ any end reason or recovery path lacks a test.
   jitter, capped per wait (default 60 s), and MUST honor a wait the service asks for when
   it fits within the cap.
 - **FR-205**: Permanent failures (refusal, invalid request, invalid or missing
-  credentials) MUST NOT be retried.
+  credentials) MUST NOT be retried. A permanent model failure MUST end the run with the
+  failing agent's existing end reason (for example `pm_error` or `qa_failed`), never
+  `dependency_unavailable`, so it exits 1 and cannot be resumed (FR-201a, FR-213b).
+  Only a temporary failure that exhausted its retries, or a call refused by an open
+  circuit, ends the run `dependency_unavailable`.
 - **FR-206**: A file-tool server that exits during a session MUST be restarted for the
   same workspace and protections, and the failed call made again. Each restart counts as
   one retry under FR-204, so restarts are bounded by the same limit.
@@ -460,13 +483,15 @@ any end reason or recovery path lacks a test.
 - **FR-214**: Each run MUST write a structured event record, one event per line, to a
   per-run location the operator can configure, flushed as events happen.
 - **FR-214a**: When the operator turns tracing on with LangSmith credentials, each run
-  MUST produce one root trace in LangSmith. Every agent invocation (each PM call, each
+  attempt (the first run and each resume) MUST produce exactly one root trace in
+  LangSmith, and every root of the same run MUST carry its run ID and, for a resume, the
+  stage it resumed from. Every agent invocation (each PM call, each
   Coder build task, reflection and fix round, each QA review and the final report) MUST
   appear as a span under that root, including invocations that run behind the A2A
   broker, carrying the metadata `agent_name`, `token_count`, `tool_calls` and
   `duration_ms`. Model calls and tool calls MUST appear as spans under their agent's
-  span. With tracing off, nothing MUST be sent, and a tracing failure MUST NOT fail the
-  run.
+  span of the same attempt. With tracing off, nothing MUST be sent, and a tracing
+  failure MUST NOT fail the run.
 - **FR-215**: Every event MUST carry a timestamp, run ID, agent (or `team`), stage, event
   type, severity, and outcome; events for model calls MUST also carry model ID, tokens
   (including re-used context), cost and duration.
@@ -512,8 +537,8 @@ any end reason or recovery path lacks a test.
   the run is resumed. A failure to write it MUST be reported and MUST NOT change the
   run's outcome.
 - **FR-223**: The operator MUST be able to set a per-run budget (no cap by default). When
-  spend reaches it, no new model call may start except QA's final report if its estimated
-  cost fits in what remains; the run ends `budget_exceeded`.
+  spend reaches it, no new model call may start. QA's final report, which makes no model
+  call, is still written, and the run ends `budget_exceeded`.
 - **FR-224**: A budget cap with a model of unknown price MUST cause the run to refuse to
   start, naming the model.
 - **FR-225**: Context that repeats across an agent's calls (system instructions, tool
@@ -524,7 +549,8 @@ any end reason or recovery path lacks a test.
 - **FR-225a**: The PM Agent's default model MUST stay the larger model it uses today. The
   Coder and QA agents' default model MUST be the smaller, faster model tier (Claude Haiku
   5.5 or the current equivalent), for every call they make, including the Coder's
-  self-reflection, QA's test writing, review and final report. Each agent's model MUST
+  self-reflection and QA's test writing and review. (QA's final report makes no model
+  call.) Each agent's model MUST
   remain configurable, so an operator can move either agent back to the larger model.
 - **FR-225b**: Every agent behavior that the default models' capabilities affect (for
   example, how much reasoning effort is requested, or server-side refusal fallback) MUST

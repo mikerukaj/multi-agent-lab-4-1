@@ -55,12 +55,17 @@ never retried. A2A requests are never guarded or retried (FR-208).
 
 ## Degradation by caller
 
+A failure is **unavailable** when `kind == "temporary"` (retries exhausted) or
+`circuit == "open"`, and **permanent** otherwise (`resilience.classify.is_unavailable`,
+FR-205). Only unavailable failures end the run `dependency_unavailable` and are
+resumable; a permanent one keeps the agent's existing end reason and exits 1.
+
 | Caller | When the guard returns `DependencyFailure` |
 |---|---|
 | `ModelCaller` (all agents) | 1) Response-cache lookup by request fingerprint. A fresh hit is validated and returned as `served_from="cache"`, with a `degraded` event (`served_from: cache`). 2) A miss returns the `DependencyFailure` to the agent. |
-| PM | `PMResult.error = "Model service unavailable: <message>"`, with `failure` attached. The team ends `dependency_unavailable` (exit 3), not `pm_error`. |
-| Coder `_think` / `_finalize` / `_critique` | the result status becomes `dependency_unavailable`, with `failure` attached. The team ends `dependency_unavailable`. |
-| QA `_ask` | `QAStepError` carries the `failure`. The iteration result has `error` set and a `failure` field. The team ends `dependency_unavailable`. |
+| PM | `failure` attached in both cases. **Unavailable**: `PMResult.error = "Model service unavailable: <message>"`, and the team ends `dependency_unavailable` (exit 3). **Permanent**: `error = "Model call failed: <message>"`, and the team ends `pm_error` (exit 1). |
+| Coder `_think` / `_finalize` / `_critique` | `failure` attached in both cases. **Unavailable**: the status becomes `dependency_unavailable`, and the team ends `dependency_unavailable`. **Permanent**: the existing `error` status, and the team ends `coder_failed` / `reflection_failed`. |
+| QA `_ask` | `QAStepError` carries the `failure`, and the iteration result has `error` set and a `failure` field. **Unavailable**: the team ends `dependency_unavailable`. **Permanent**: the team ends `qa_failed`. |
 | Coder tool call (MCP / sandbox) | a tool result with `is_error: true`, content `json.dumps(DependencyFailure)`. The ReAct loop continues and the model decides. |
 | QA MCP or pytest | `QAStepError` naming the dependency → `dependency_unavailable`. |
 | Chroma (memory) | `query` → `[]` with a `degraded` event, and `add` is skipped with a `degraded` event. Memory is advisory, so the run continues. |

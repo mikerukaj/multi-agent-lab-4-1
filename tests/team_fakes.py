@@ -12,10 +12,23 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from agents.coder_agent import CoderResult, ReflectionResult
+from resilience.circuit import GuardFailure
 from tools.file_tools import READ_FILE_TOOL, WRITE_FILE_TOOL
 from tools.mcp_server import call_tool
 
 PRIORITY_CYCLE = ("high", "medium", "low")
+
+
+def token_usage(
+    input_tokens: int, output_tokens: int, cache_creation: int = 0, cache_read: int = 0
+) -> dict:
+    """A usage dict with all four token counters, as the run state now carries them."""
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_creation_input_tokens": cache_creation,
+        "cache_read_input_tokens": cache_read,
+    }
 
 
 def pm_response(
@@ -203,10 +216,12 @@ class FakeFileTools:
     sessions: list["FakeFileTools"] = []
 
     def __init__(
-        self, workspace: Path, protect: tuple[str, ...] = (), call_timeout_seconds: float = 30.0
+        self, workspace: Path, protect: tuple[str, ...] = (), call_timeout_seconds: float = 30.0,
+        guard=None,
     ) -> None:
         self.workspace = Path(workspace).resolve()
         self.protect = tuple(protect)
+        self.guard = guard
         self.calls: list[tuple[str, dict]] = []
         self.closed = False
 
@@ -233,8 +248,15 @@ class FakeFileTools:
         ]
 
     def call(self, name: str, arguments: dict) -> tuple[str, bool]:
+        """Serve one call; with a guard, an open ``mcp`` circuit fails it as the real
+        client does (a ``DependencyFailure`` JSON body with ``is_error`` set)."""
         self.calls.append((name, dict(arguments)))
-        return call_tool(self.workspace, self.protect, name, arguments)
+        if self.guard is None:
+            return call_tool(self.workspace, self.protect, name, arguments)
+        outcome = self.guard.call(lambda: call_tool(self.workspace, self.protect, name, arguments))
+        if isinstance(outcome, GuardFailure):
+            return json.dumps(outcome.failure), True
+        return outcome
 
 
 def scripted_test_run(failed: int = 0, loaded: bool = True, timed_out: bool = False) -> dict:

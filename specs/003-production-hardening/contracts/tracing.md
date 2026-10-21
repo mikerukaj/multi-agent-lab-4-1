@@ -27,8 +27,10 @@ team-run                                   run_type=chain   (root; one per run a
 
 **Invariant (tested)**: every `agent:*` span in a run has the root's `trace_id`, and the
 `team-run` span is its ancestor. There is exactly one span with no parent per run
-attempt. A resumed run opens a new `team-run` root with `metadata.resumed_from_stage`
-and the same `run_id`. That is one root per attempt, linked by `run_id`.
+attempt. Root metadata is `run_id`, `attempt` (1 for the first run, +1 per resume),
+`requirement_chars`, `max_iterations` and `resumed_from_stage` (`None` on attempt 1). A
+resumed run opens a new `team-run` root with the same `run_id`, the next `attempt` and
+`resumed_from_stage` set. That is one root per attempt, linked by `run_id`.
 
 ### Agent invocations that open an `agent:*` span
 

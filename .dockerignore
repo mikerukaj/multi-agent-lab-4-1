@@ -1,0 +1,18 @@
+# Never in the image: secrets, local state and run outputs (FR-228, contracts/deployment.md).
+.env
+.env*
+.git
+.venv/
+__pycache__/
+*.pyc
+workspace/
+.chroma/
+.cache/
+docs/cost_reports/*.json
+benchmarks/results/
+specs/
+.claude/
+.specify/
+.coverage
+.coverage.*
+htmlcov/

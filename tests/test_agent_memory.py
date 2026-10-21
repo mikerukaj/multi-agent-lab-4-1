@@ -1,10 +1,16 @@
 """Tests for the Coder Agent's two-tier memory (agents/memory.py)."""
 
+import random
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from agents import memory
 from agents.memory import SemanticMemory, SlidingWindowBuffer, Turn
+from resilience.circuit import CircuitBreaker, DependencyGuard
+from resilience.retry import RetryPolicy
 
 
 class SlidingWindowBufferTests(unittest.TestCase):
@@ -66,6 +72,112 @@ class SemanticMemoryTests(unittest.TestCase):
         reopened = SemanticMemory(Path(self._tmp.name) / "chroma")
         results = reopened.query("penguins", top_k=1, exclude_run_id="run-b")
         self.assertIn("penguins", results[0][1])
+
+
+
+class ServerModeTests(unittest.TestCase):
+    """``CHROMA_HOST`` switches the memory to a Chroma server (FR-230a, T077)."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+
+    def open_store(self, **kwargs) -> tuple[SemanticMemory, mock.MagicMock, mock.MagicMock]:
+        http, persistent = mock.MagicMock(), mock.MagicMock()
+        collection = mock.MagicMock()
+        collection.count.side_effect = range(100)
+        for client in (http, persistent):
+            client.return_value.get_or_create_collection.return_value = collection
+        with mock.patch.object(memory.chromadb, "HttpClient", http), \
+                mock.patch.object(memory.chromadb, "PersistentClient", persistent):
+            store = SemanticMemory(Path(self._tmp.name) / "c", **kwargs)
+        return store, http, persistent
+
+    def test_a_host_uses_the_http_client(self) -> None:
+        _, http, persistent = self.open_store(host="chroma", port=8000)
+        self.assertEqual((http.call_args.kwargs["host"], http.call_args.kwargs["port"]),
+                         ("chroma", 8000))
+        persistent.assert_not_called()
+
+    def test_without_a_host_the_embedded_store_is_used(self) -> None:
+        _, http, persistent = self.open_store()
+        http.assert_not_called()
+        self.assertTrue(persistent.call_args.kwargs["path"].endswith("/c"))
+
+    def test_both_modes_open_the_collection_the_same_way(self) -> None:
+        _, http, _ = self.open_store(host="chroma")
+        _, _, persistent = self.open_store()
+        self.assertEqual(http.return_value.get_or_create_collection.call_args,
+                         persistent.return_value.get_or_create_collection.call_args)
+
+    def test_record_ids_are_the_run_id_and_a_number(self) -> None:
+        store, _, _ = self.open_store(host="chroma")
+        self.assertEqual(store.add("20261020-run", "task", "a"), "20261020-run-0")
+        self.assertEqual(store.add("20261020-run", "task", "b"), "20261020-run-1")
+
+    def test_the_coder_config_reads_chroma_host_and_port(self) -> None:
+        from agents.coder_agent import CoderConfig
+        with mock.patch.dict("os.environ", {"CHROMA_HOST": "chroma", "CHROMA_PORT": "8100"}):
+            config = CoderConfig.from_env()
+        self.assertEqual((config.chroma_host, config.chroma_port), ("chroma", 8100))
+        with mock.patch.dict("os.environ", {}, clear=False):
+            self.assertIsNone(CoderConfig().chroma_host)
+
+
+class UnreachableClient:
+    """A Chroma client whose server is down: every call raises ``ConnectionError``."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        raise ConnectionError("Connection refused")
+
+
+class FlakyCollection:
+    """A collection whose calls fail with ``ConnectionError`` after it was opened."""
+
+    def count(self) -> int:
+        raise ConnectionError("Connection reset")
+
+
+class DegradedMemoryTests(unittest.TestCase):
+    """With a guard, memory failures degrade instead of crashing the run."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.events: list[dict] = []
+        self.sleeps: list[float] = []
+        self.guard = DependencyGuard(
+            "chroma", "store", CircuitBreaker("chroma:store"), RetryPolicy(),
+            random.Random(0), self.sleeps.append, threading.Event(), self.events.append,
+        )
+
+    def test_an_unreachable_store_gives_no_hits_and_skips_writes(self) -> None:
+        with mock.patch.object(memory.chromadb, "PersistentClient", UnreachableClient):
+            store = SemanticMemory(Path(self._tmp.name) / "c", guard=self.guard)
+            self.assertEqual(store.query("anything", top_k=3, exclude_run_id="r"), [])
+            self.assertEqual(store.add("r", "task", "remember this"), "")
+            # Constructor, query and add each tried to connect, with 3 retries each;
+            # the third failed call opened the circuit, so the next one fails fast.
+            self.assertEqual(len(self.sleeps), 9)
+            self.assertEqual(self.guard.breaker.state, "open")
+            self.assertEqual(store.query("again", top_k=3, exclude_run_id="r"), [])
+            self.assertEqual(len(self.sleeps), 9)
+        degraded = [event for event in self.events if event["event"] == "degraded"]
+        self.assertEqual(len(degraded), 5)
+        self.assertEqual(degraded[0]["dependency"], "chroma")
+
+    def test_a_failing_query_or_add_degrades_after_connecting(self) -> None:
+        store = SemanticMemory(Path(self._tmp.name) / "c", guard=self.guard)
+        store._collection = FlakyCollection()
+        self.assertEqual(store.query("anything", top_k=3, exclude_run_id="r"), [])
+        self.assertEqual(store.add("r", "task", "x"), "")
+        self.assertEqual([e["outcome"] for e in self.events if e["event"] == "degraded"],
+                         ["memory query skipped", "memory add skipped"])
+
+    def test_without_a_guard_failures_still_raise(self) -> None:
+        with mock.patch.object(memory.chromadb, "PersistentClient", UnreachableClient):
+            with self.assertRaises(ConnectionError):
+                SemanticMemory(Path(self._tmp.name) / "c")
 
 
 if __name__ == "__main__":

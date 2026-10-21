@@ -1,7 +1,8 @@
 """Live end-to-end check of the Coder Agent against the real model.
 
-Skipped unless ANTHROPIC_API_KEY is set (in the environment or .env) and Docker is
-available. When it runs, it makes real model calls.
+It makes real, paid model calls, so it runs only when asked for explicitly with
+``RUN_LIVE_E2E=1`` (with a key, in the environment or .env, and Docker), never in the
+default offline suite (FR-236).
 """
 
 import os
@@ -13,11 +14,13 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from agents.coder_agent import CoderConfig, run_coder_agent
+from tests import LIVE
 
 load_dotenv()
 
 
-@unittest.skipUnless(os.environ.get("ANTHROPIC_API_KEY"), "ANTHROPIC_API_KEY is not set")
+@unittest.skipUnless(LIVE and os.environ.get("ANTHROPIC_API_KEY"),
+                     "RUN_LIVE_E2E is not set (the live run makes paid model calls)")
 @unittest.skipUnless(shutil.which("docker"), "Docker is not available")
 class CoderAgentSmokeTest(unittest.TestCase):
     def test_fibonacci_task_returns_structured_result(self) -> None:

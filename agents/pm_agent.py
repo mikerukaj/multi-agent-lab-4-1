@@ -8,12 +8,33 @@ before they are used. See specs/001-autonomous-dev-team/contracts/pm-agent-api.m
 import json
 import os
 import typing
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import anthropic
 
-from agents.llm import EFFORT_LEVELS, MAX_TOKENS, refusal_message, with_fallbacks
-from orchestration.state import Priority, Task, TechnicalSpec, TokenUsage
+from agents.llm import (
+    EFFORT_LEVELS,
+    LARGE_MODEL,
+    MAX_TOKENS,
+    check_model_settings,
+    fallbacks_from_env,
+    resolve_fallbacks,
+    ModelCaller,
+    failure_message,
+    output_problem,
+    system_blocks,
+    with_fallbacks,
+)
+from orchestration.services import RunServices
+from orchestration.state import (
+    DependencyFailure,
+    PMConsolidationReply,
+    PMSpecReply,
+    Priority,
+    Task,
+    TechnicalSpec,
+    TokenUsage,
+)
 
 MAX_TASKS = 8
 PRIORITIES = typing.get_args(Priority)
@@ -99,15 +120,22 @@ merge that drops, rewords or reorders a criterion."""
 class PMConfig:
     """Settings for the PM Agent; ``from_env`` applies ``PM_*`` overrides."""
 
-    model: str = "claude-sonnet-5-5"
+    model: str = LARGE_MODEL
     effort: str = "high"
-    use_fallbacks: bool = True
+    use_fallbacks: bool | None = None
+    """``None`` means on if the model supports server-side refusal fallback."""
+
+    warnings: list[str] = field(default_factory=list, init=False, repr=False,
+                                compare=False)
+    """Settings the capability table could not check (an unknown model)."""
 
     def __post_init__(self) -> None:
         if not self.model:
             raise ValueError("model must not be empty")
         if self.effort not in EFFORT_LEVELS:
             raise ValueError(f"effort must be one of {', '.join(EFFORT_LEVELS)}")
+        self.use_fallbacks = resolve_fallbacks(self.model, self.use_fallbacks)
+        self.warnings = check_model_settings("pm", self.model, self.effort, self.use_fallbacks)
 
     @classmethod
     def from_env(cls) -> "PMConfig":
@@ -121,27 +149,40 @@ class PMConfig:
         return cls(
             model=env.get("PM_MODEL", defaults.model),
             effort=env.get("PM_EFFORT", defaults.effort),
-            use_fallbacks=env.get("PM_USE_FALLBACKS", "true").lower()
-            not in ("0", "false", "no"),
+            use_fallbacks=fallbacks_from_env(env.get("PM_USE_FALLBACKS")),
         )
 
 
 @dataclass
 class PMResult:
-    """Outcome of one PM call: exactly one of ``spec``, ``rejection_reason`` or ``error``."""
+    """Outcome of one PM call: exactly one of ``spec``, ``rejection_reason`` or ``error``.
+
+    ``failure`` is set when the model call itself could not be served (FR-209c).
+    """
 
     spec: TechnicalSpec | None
     rejection_reason: str | None
     error: str | None
     usage: TokenUsage
+    failure: DependencyFailure | None = None
 
 
 class PMAgent:
     """The Product Manager Agent. Every call stands alone; no history is kept."""
 
-    def __init__(self, config: PMConfig | None = None, client=None) -> None:
+    def __init__(
+        self, config: PMConfig | None = None, client=None, services: RunServices | None = None
+    ) -> None:
         self.config = config or PMConfig.from_env()
-        self._client = client or anthropic.Anthropic(max_retries=3)
+        # The SDK's own retries are off: the run's dependency guard retries (research R3).
+        self._client = client or anthropic.Anthropic(max_retries=0)
+        self._services = services or RunServices.create()
+        self._caller = ModelCaller("pm", self._client, self._services)
+
+    def attach(self, services: RunServices) -> None:
+        """Use ``services`` (the run's shared helpers) for every later call."""
+        self._services = services
+        self._caller = ModelCaller("pm", self._client, services)
 
     def write_spec(self, requirement: str) -> PMResult:
         """Write the technical specification and ordered tasks for ``requirement``.
@@ -154,12 +195,14 @@ class PMAgent:
         """
         if not requirement.strip():
             raise ValueError("requirement must not be empty")
-        data, error, usage = self._call(f"Requirement:\n{requirement}", SPEC_SCHEMA)
+        data, error, usage, failure = self._call(
+            f"Requirement:\n{requirement}", SPEC_SCHEMA, PMSpecReply
+        )
         if error is None and data["rejection_reason"].strip():
             return PMResult(None, data["rejection_reason"].strip(), None, usage)
         error = error or _validate_spec(data)
         if error:
-            return PMResult(None, None, error, usage)
+            return PMResult(None, None, error, usage, failure)
         spec = TechnicalSpec(
             name=data["name"],
             description=data["description"],
@@ -180,11 +223,13 @@ class PMAgent:
             f"Requirement:\n{requirement}\n\n{CONSOLIDATE_PROMPT}\n\n"
             f"Current tasks:\n{json.dumps(spec['tasks'], indent=2)}"
         )
-        data, error, usage = self._call(user_text, CONSOLIDATION_SCHEMA)
+        data, error, usage, failure = self._call(
+            user_text, CONSOLIDATION_SCHEMA, PMConsolidationReply
+        )
         if error is None:
             error = _consolidation_problem(spec["tasks"], data["tasks"])
         if error:
-            return PMResult(None, None, f"Consolidation rejected: {error}", usage)
+            return PMResult(None, None, f"Consolidation rejected: {error}", usage, failure)
         return PMResult({**spec, "tasks": number_tasks(data["tasks"])}, None, None, usage)
 
     def _request(self, user_text: str, schema: dict) -> dict:
@@ -192,7 +237,7 @@ class PMAgent:
         request = {
             "model": self.config.model,
             "max_tokens": MAX_TOKENS,
-            "system": PM_SYSTEM_PROMPT,
+            "system": system_blocks(PM_SYSTEM_PROMPT, self._services.prompt_cache_ttl),
             "messages": [{"role": "user", "content": user_text}],
             "thinking": {"type": "adaptive"},
             "output_config": {
@@ -202,23 +247,18 @@ class PMAgent:
         }
         return with_fallbacks(request, self.config.use_fallbacks)
 
-    def _call(self, user_text: str, schema: dict) -> tuple[dict | None, str | None, TokenUsage]:
-        """Make one model call and return its parsed JSON, an error, and the usage."""
-        usage = TokenUsage(input_tokens=0, output_tokens=0)
-        try:
-            response = self._client.beta.messages.create(**self._request(user_text, schema))
-        except anthropic.APIError as error:
-            return None, f"Model call failed: {error}", usage
-        usage = TokenUsage(
-            input_tokens=response.usage.input_tokens, output_tokens=response.usage.output_tokens
-        )
-        if response.stop_reason == "refusal":
-            return None, refusal_message(response.stop_details), usage
-        text = "".join(block.text for block in response.content if block.type == "text")
-        try:
-            return json.loads(text), None, usage
-        except json.JSONDecodeError:
-            return None, f"Model output is not valid JSON: {text[:200]!r}", usage
+    def _call(
+        self, user_text: str, schema: dict, reply_type: type
+    ) -> tuple[dict | None, str | None, TokenUsage, DependencyFailure | None]:
+        """Make one model call; return its validated reply, an error, usage and failure."""
+        reply = self._caller.call(self._request(user_text, schema), reply_type)
+        if reply.failure:
+            return None, failure_message(reply.failure), reply.usage, reply.failure
+        if reply.refusal:
+            return None, reply.refusal, reply.usage, None
+        if reply.problems:
+            return None, output_problem(reply.problems), reply.usage, None
+        return reply.data, None, reply.usage, None
 
 
 def number_tasks(items: list[dict]) -> list[Task]:

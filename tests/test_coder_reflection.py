@@ -4,6 +4,7 @@ See specs/002-qa-feedback-loop-mcp/contracts/coder-reflection.md.
 """
 
 import json
+from dataclasses import replace
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,7 +13,10 @@ from unittest import mock
 
 from agents import coder_agent
 from agents.coder_agent import CRITIQUE_FORMAT, SUMMARY_FORMAT, CoderAgent, CoderConfig
-from tests.team_fakes import FakeFileTools
+from orchestration.team import reflect_node
+from tests.fakes import assert_no_live_dependencies
+from tests.fakes import scripted_claude as sc
+from tests.team_fakes import FakeFileTools, token_usage
 
 SOURCE = "def add(a, b):\n    return a + b  # SOURCE_MARKER\n"
 
@@ -33,6 +37,10 @@ def critique(*descriptions: str) -> SimpleNamespace:
         for text in descriptions
     ]
     return text_reply(json.dumps({"items": items, "overall": "Mostly fine."}))
+
+
+def setUpModule() -> None:
+    assert_no_live_dependencies()
 
 
 class ReflectionClient:
@@ -88,7 +96,9 @@ class ReflectionClient:
 
 
 class FakeMemory:
-    def __init__(self, path: Path, collection: str = "coder_memory") -> None:
+    def __init__(
+        self, path: Path, collection: str = "coder_memory", guard=None, host=None, port=8000
+    ) -> None:
         pass
 
     def add(self, run_id: str, kind: str, text: str) -> str:
@@ -116,7 +126,7 @@ class ReflectionTestCase(unittest.TestCase):
         FakeFileTools.reset()
 
     def agent(self, client, **config_changes) -> CoderAgent:
-        config = CoderConfig(**{**self.config.__dict__, **config_changes})
+        config = replace(self.config, **config_changes)
         return CoderAgent(config, client=client, file_tools=FakeFileTools)
 
 
@@ -127,7 +137,7 @@ class ReflectTests(ReflectionTestCase):
         request = client.critique_requests[0]
         self.assertNotIn("tools", request)
         self.assertEqual(request["output_config"]["format"], CRITIQUE_FORMAT)
-        prompt = request["messages"][0]["content"]
+        prompt = "\n\n".join(block["text"] for block in request["messages"][0]["content"])
         self.assertIn("SOURCE_MARKER", prompt)
         self.assertIn("Build a calculator.", prompt)
         self.assertNotIn("TEST_MARKER", prompt)
@@ -147,7 +157,7 @@ class ReflectTests(ReflectionTestCase):
         )
         self.assertEqual(result.result.explanation, "Revised add().")
         self.assertEqual(reflection["summary"], "Revised add().")
-        self.assertEqual(result.usage, {"input_tokens": 30, "output_tokens": 15})
+        self.assertEqual(result.usage, token_usage(30, 15))
 
     def test_empty_critique_is_retried_once_then_an_error(self) -> None:
         empty = text_reply(json.dumps({"items": [], "overall": "Nothing."}))
@@ -207,6 +217,91 @@ class FindingResponseTests(ReflectionTestCase):
         self.assertIn("finding_responses", schema["required"])
         action = schema["properties"]["finding_responses"]["items"]["properties"]["action"]
         self.assertEqual(action["enum"], ["fixed", "disputed", "not_addressed"])
+
+
+
+class DependencyFailureTests(ReflectionTestCase):
+    """The Coder reports a model call it can't make, and how (FR-205, FR-209c)."""
+
+    def test_an_unavailable_model_ends_the_session_dependency_unavailable(self) -> None:
+        client = sc.ScriptedClaude([sc.overloaded_error()] * 4)
+        result = self.agent(client).run("Build", self.workspace)
+        self.assertEqual(result.status, "dependency_unavailable")
+        self.assertTrue(result.error.startswith("Model service unavailable"), result.error)
+        self.assertEqual(result.failure["kind"], "temporary")
+        self.assertEqual(client.remaining, 0)
+
+    def test_a_permanent_model_failure_is_an_error(self) -> None:
+        client = sc.ScriptedClaude([sc.auth_error()])
+        result = self.agent(client).run("Build", self.workspace)
+        self.assertEqual(result.status, "error")
+        self.assertTrue(result.error.startswith("Model call failed"), result.error)
+        self.assertEqual(result.failure["kind"], "permanent")
+
+    def test_a_failed_critique_call_carries_its_failure_into_the_reflection(self) -> None:
+        reflection = self.agent(sc.ScriptedClaude([sc.overloaded_error()] * 4)).reflect(
+            "B", self.workspace
+        )
+        self.assertEqual(reflection.status, "dependency_unavailable")
+        self.assertEqual(reflection.failure["dependency"], "anthropic")
+        self.assertIn("Critique call failed", reflection.result.error)
+
+
+class SummaryClient(ReflectionClient):
+    """Writes ``calc.py`` once, then answers the summary call with ``summary``."""
+
+    def __init__(self, summary: dict) -> None:
+        super().__init__([], loop_stop="tool_use")
+        self._summary = summary
+
+    def _create(self, **kwargs):
+        if kwargs["output_config"].get("format") == SUMMARY_FORMAT:
+            self.requests.append(kwargs)
+            return text_reply(json.dumps(self._summary))
+        return super()._create(**kwargs)
+
+
+class ReplyValidationTests(ReflectionTestCase):
+    """Coder replies that fail their ``TypedDict`` are never used as they are (FR-219a)."""
+
+    def test_a_summary_missing_main_file_falls_back_and_keeps_the_code(self) -> None:
+        summary = {"plan": ["Write"], "explanation": "Done.", "finding_responses": []}
+        client = SummaryClient(summary)
+        result = self.agent(client, max_steps=2).run("Build", self.workspace)
+        self.assertEqual(result.validation_problems, ["$: missing required key 'main_file'"])
+        self.assertEqual(result.plan, [])
+        self.assertEqual(result.explanation, json.dumps(summary))
+        self.assertEqual(result.main_file, "calc.py")
+        self.assertEqual(result.code, SOURCE)
+
+    def test_a_valid_summary_records_no_problems(self) -> None:
+        summary = {"plan": ["Write"], "explanation": "Done.", "main_file": "calc.py",
+                   "finding_responses": []}
+        result = self.agent(SummaryClient(summary), max_steps=2).run("Build", self.workspace)
+        self.assertEqual(result.validation_problems, [])
+        self.assertEqual(result.plan, ["Write"])
+
+    def test_a_critique_item_with_an_unknown_kind_fails_reflection(self) -> None:
+        bad = text_reply(json.dumps({"items": [
+            {"kind": "typo", "location": "add()", "description": "d", "suggested_change": "s"}
+        ], "overall": "o"}))
+        client = ReflectionClient([bad])
+        result = self.agent(client).reflect("B", self.workspace)
+        self.assertEqual(result.status, "error")
+        self.assertIn("Critique output failed validation: $.items[0].kind: 'typo'",
+                      result.result.error)
+        self.assertEqual(client.revision_tasks, [])
+
+    def test_the_team_maps_a_failed_critique_to_reflection_failed(self) -> None:
+        bad = text_reply(json.dumps({"items": [{"kind": "typo"}], "overall": "o"}))
+        state = {
+            "iterations": [], "usage": token_usage(0, 0), "workspace": str(self.workspace),
+            "spec": {"name": "Calc", "description": "Adds.", "acceptance_criteria": ["adds"],
+                     "assumptions": [], "tasks": []},
+        }
+        update = reflect_node(state, self.agent(ReflectionClient([bad])))
+        self.assertEqual(update["end_reason"], "reflection_failed")
+        self.assertIn("Critique output failed validation", update["error"])
 
 
 if __name__ == "__main__":

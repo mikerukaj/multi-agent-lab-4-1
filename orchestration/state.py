@@ -10,9 +10,14 @@ and the JSON-only request payloads that cross the A2A broker (``QAContext``,
 ``FixRequest``, ``FinalReportRequest``). The payloads live here, not in an agent
 module, so neither agent imports the other
 (specs/002-qa-feedback-loop-mcp/data-model.md).
+
+Production hardening (003) adds per-agent usage and cost, structured dependency
+failures, resume history, the run summary, and one reply ``TypedDict`` per model-facing
+JSON schema, so every model output is validated before it is used
+(specs/003-production-hardening/data-model.md).
 """
 
-from typing import Literal, TypedDict
+from typing import Literal, NotRequired, TypedDict
 
 Priority = Literal["high", "medium", "low"]
 TaskStatus = Literal["pending", "in_progress", "completed", "failed", "skipped"]
@@ -28,6 +33,22 @@ TestChangeReason = Literal[
     "initial", "load_repair", "dispute_correction", "regression", "restored"
 ]
 CritiqueKind = Literal["bug", "edge_case"]
+ConstitutionRule = Literal[
+    "intent-revealing-names",
+    "function-does-one-thing",
+    "public-api-type-hints-and-docstrings",
+    "comments-explain-why",
+    "no-commented-out-code",
+    "explicit-error-handling",
+    "extract-triplicated-logic",
+    "python-3.12-only",
+    "pep8-pep257",
+    "import-grouping",
+    "no-wildcard-imports",
+    "no-hardcoded-secrets",
+    "main-guard",
+]
+"""The constitution MUST rules a QA style finding may cite to become blocking."""
 Verdict = Literal["complete", "fix_needed"]
 EndReason = Literal[
     "complete",
@@ -39,7 +60,19 @@ EndReason = Literal[
     "a2a_failed",
     "rejected",
     "pm_error",
+    "dependency_unavailable",
+    "budget_exceeded",
+    "interrupted",
 ]
+RESUMABLE_END_REASONS = ("dependency_unavailable", "a2a_failed", "budget_exceeded", "interrupted")
+Dependency = Literal["anthropic", "mcp", "sandbox", "chroma", "a2a"]
+FailureKind = Literal["temporary", "permanent"]
+CircuitState = Literal["closed", "open", "half_open"]
+ServedFrom = Literal["live", "cache"]
+AgentName = Literal["pm", "coder", "qa"]
+Stage = Literal["plan", "consolidate", "build", "reflect", "qa_review", "fix", "final_report", "team"]
+# Named EventSeverity because ``Severity`` already means a finding's severity.
+EventSeverity = Literal["debug", "info", "warning", "error"]
 
 
 class Task(TypedDict):
@@ -92,10 +125,84 @@ class Consolidation(TypedDict):
 
 
 class TokenUsage(TypedDict):
-    """Tokens used by model calls, summed over the run."""
+    """Tokens used by model calls, summed over the run.
+
+    ``input_tokens`` is uncached input. Records written before 003 have no cache keys;
+    readers treat a missing key as 0.
+    """
 
     input_tokens: int
     output_tokens: int
+    cache_creation_input_tokens: NotRequired[int]
+    cache_read_input_tokens: NotRequired[int]
+
+
+class AgentUsage(TypedDict):
+    """One agent's model and tool use in a run, with its cost (data-model §1.3)."""
+
+    agent: AgentName
+    models: list[str]
+    model_calls: int
+    cached_replays: int
+    prompt_tokens: int
+    completion_tokens: int
+    cache_read_tokens: int
+    cache_write_tokens: int
+    cost_usd: float | None
+    retries: int
+    errors: int
+    tool_calls: int
+    duration_ms: int
+
+
+class DependencyFailure(TypedDict):
+    """A call to an external dependency that could not be served (data-model §1.4)."""
+
+    dependency: Dependency
+    target: str
+    kind: FailureKind
+    attempts: int
+    circuit: CircuitState
+    error_type: str
+    message: str
+    retry_after_seconds: float | None
+
+
+class ResumeAttempt(TypedDict):
+    """One continuation of an interrupted or resumable run (data-model §1.5)."""
+
+    resumed_at: str
+    from_stage: Stage
+    next_node: str
+    previous_end_reason: EndReason | None
+    budget_before_usd: float | None
+    budget_after_usd: float | None
+    restored_files: list[str]
+    removed_files: list[str]
+
+
+class SummaryCounters(TypedDict):
+    """The totals the run summary keeps per agent, per stage and for the run."""
+
+    model_calls: int
+    prompt_tokens: int
+    completion_tokens: int
+    cache_read_tokens: int
+    cost_usd: float | None
+    duration_ms: int
+    retries: int
+    restarts: int
+    errors: int
+
+
+class RunSummary(TypedDict):
+    """Totals for a run across every attempt (data-model §2.2, FR-217)."""
+
+    per_agent: dict[str, SummaryCounters]
+    per_stage: dict[str, SummaryCounters]
+    totals: SummaryCounters
+    events_lost: bool
+    attempts: int
 
 
 class TestCaseResult(TypedDict):
@@ -305,3 +412,161 @@ class TeamState(TypedDict):
     qa_report: QAReport | None
     end_reason: EndReason | None
     a2a_log: list[A2AExchange]
+    agent_usage: dict[str, AgentUsage]
+    cost_usd: float | None
+    budget_usd: float | None
+    failure: DependencyFailure | None
+    resume_from: str | None
+    resume_history: list[ResumeAttempt]
+    events_lost: bool
+    trace_url: str | None
+    cost_report_path: str | None
+    summary: RunSummary | None
+
+
+# Reply types: one per JSON schema sent to the model, mirrored field for field
+# (tests/test_validation.py::SchemaAgreementTests keeps them in step). Every reply is
+# checked with ``orchestration.validation.validate`` before anything in it is used.
+
+
+class TaskItemReply(TypedDict):
+    """One task in a PM reply (``TASK_ITEM_SCHEMA``)."""
+
+    title: str
+    description: str
+    acceptance_criteria: list[str]
+    priority: Priority
+
+
+class PMSpecReply(TypedDict):
+    """The PM's ``write_spec`` reply (``SPEC_SCHEMA``)."""
+
+    name: str
+    description: str
+    acceptance_criteria: list[str]
+    assumptions: list[str]
+    tasks: list[TaskItemReply]
+    rejection_reason: str
+
+
+class PMConsolidationReply(TypedDict):
+    """The PM's ``consolidate`` reply (``CONSOLIDATION_SCHEMA``)."""
+
+    tasks: list[TaskItemReply]
+
+
+class FindingResponseReply(TypedDict):
+    """One answer in the Coder's summary (``SUMMARY_FORMAT`` ``finding_responses``)."""
+
+    finding_id: str
+    action: ResponseAction
+    reason: str
+
+
+class CoderSummaryReply(TypedDict):
+    """The Coder's closing summary (``SUMMARY_FORMAT``)."""
+
+    plan: list[str]
+    explanation: str
+    main_file: str
+    finding_responses: list[FindingResponseReply]
+
+
+class CritiqueItemReply(TypedDict):
+    """One item of the Coder's self-critique (``CRITIQUE_FORMAT`` ``items``)."""
+
+    kind: CritiqueKind
+    location: str
+    description: str
+    suggested_change: str
+
+
+class CritiqueReply(TypedDict):
+    """The Coder's self-critique (``CRITIQUE_FORMAT``)."""
+
+    items: list[CritiqueItemReply]
+    overall: str
+
+
+class TestFileReply(TypedDict):
+    """One test file QA writes (``TEST_FILE_SCHEMA``)."""
+
+    path: str
+    content: str
+    criteria: list[str]
+
+
+class QATestFilesReply(TypedDict):
+    """QA's initial tests or load repair (``WRITE_TESTS_FORMAT``)."""
+
+    test_files: list[TestFileReply]
+    notes: str
+
+
+class DisputeDecisionReply(TypedDict):
+    """QA's decision on one disputed finding (``DISPUTES_FORMAT`` ``decisions``)."""
+
+    finding_id: str
+    decision: DisputeDecision
+    reason: str
+
+
+class QADisputeReply(TypedDict):
+    """QA's dispute resolution (``DISPUTES_FORMAT``)."""
+
+    decisions: list[DisputeDecisionReply]
+    corrected_files: list[TestFileReply]
+
+
+class ReviewFindingReply(TypedDict):
+    """One finding in QA's review (``REVIEW_FINDING_SCHEMA``)."""
+
+    kind: FindingKind
+    rule: Literal["", ConstitutionRule]
+    file: str
+    location: str
+    problem: str
+    expected: str
+    likely_cause: str
+    fix_instruction: str
+    test_ids: list[str]
+    same_as: str
+
+
+class RegressionTestReply(TypedDict):
+    """A regression test QA adds for a finding (``REVIEW_FORMAT`` ``regression_tests``)."""
+
+    finding_index: int
+    path: str
+    content: str
+    criteria: list[str]
+
+
+class QAReviewReply(TypedDict):
+    """QA's review (``REVIEW_FORMAT``)."""
+
+    findings: list[ReviewFindingReply]
+    regression_tests: list[RegressionTestReply]
+    summary: str
+
+
+class ReadFileInput(TypedDict):
+    """The input the model gives ``read_file`` (with the session's ``purpose``)."""
+
+    path: str
+    purpose: str
+
+
+class WriteFileInput(TypedDict):
+    """The input the model gives ``write_file`` (with the session's ``purpose``)."""
+
+    path: str
+    content: str
+    purpose: str
+
+
+class ExecPythonInput(TypedDict):
+    """The input the model gives ``exec_python`` (with the session's ``purpose``)."""
+
+    path: str
+    purpose: str

@@ -6,6 +6,7 @@ import json
 import shutil
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -22,17 +23,23 @@ from agents.coder_agent import (
     Step,
     ToolCall,
 )
-from tests.team_fakes import FakeFileTools
+from tests.fakes import assert_no_live_dependencies
+from tests.fakes import scripted_claude as sc
+from tests.fakes.local_sandbox import local_exec_python
+from tests.team_fakes import FakeFileTools, token_usage
 from tools.mcp_client import McpUnavailableError
 from tools.python_exec import SandboxUnavailableError
 
-# These loops run generated code in the real sandbox, so they need Docker.
+# The loop tests run their fixture scripts with a local stand-in for the sandbox, so they
+# need no Docker; tests/integration/test_coder_sandbox.py runs the same classes with the
+# real sandbox (FR-235a).
 requires_docker = unittest.skipUnless(shutil.which("docker"), "Docker is not available")
 
 SUMMARY = {
     "plan": ["Write main.py", "Run main.py"],
     "explanation": "Wrote main.py, which prints hi.",
     "main_file": "main.py",
+    "finding_responses": [],
 }
 
 
@@ -55,6 +62,10 @@ def response(content: list, stop_reason: str, stop_details=None) -> SimpleNamesp
         stop_details=stop_details,
         usage=SimpleNamespace(input_tokens=10, output_tokens=5),
     )
+
+
+def setUpModule() -> None:
+    assert_no_live_dependencies()
 
 
 class FakeClient:
@@ -94,7 +105,9 @@ class FakeMemory:
     events: list = []
     records: list = []
 
-    def __init__(self, path: Path, collection: str = "coder_memory") -> None:
+    def __init__(
+        self, path: Path, collection: str = "coder_memory", guard=None, host=None, port=8000
+    ) -> None:
         pass
 
     def add(self, run_id: str, kind: str, text: str) -> str:
@@ -107,7 +120,17 @@ class FakeMemory:
 
 
 class AgentTestCase(unittest.TestCase):
+    real_sandbox = False
+    """Set by the integration subclasses, which run the same tests in Docker."""
+
     def setUp(self) -> None:
+        if not self.real_sandbox:
+            for target, value in (("agents.coder_agent.ensure_sandbox", lambda image: None),
+                                  ("agents.coder_agent.exec_python", local_exec_python),
+                                  ("tools.exec_python", local_exec_python)):
+                patcher = mock.patch(target, value)
+                patcher.start()
+                self.addCleanup(patcher.stop)
         self._tmp = tempfile.TemporaryDirectory()
         root = Path(self._tmp.name)
         self.config = CoderConfig(
@@ -133,7 +156,8 @@ def happy_path_script() -> list:
         response(
             [
                 thinking_block("I should write the file first."),
-                tool_use("t1", "write_file", {"path": "main.py", "content": "print('hi')\n"}),
+                tool_use("t1", "write_file", {"path": "main.py", "content": "print('hi')\n",
+                                              "purpose": "Write the program."}),
             ],
             "tool_use",
         ),
@@ -145,7 +169,6 @@ def happy_path_script() -> list:
     ]
 
 
-@requires_docker
 class HappyPathTests(AgentTestCase):
     def setUp(self) -> None:
         super().setUp()
@@ -200,16 +223,16 @@ class HappyPathTests(AgentTestCase):
             self.assertEqual(prefix, previous["messages"])
 
     def test_usage_and_duration_are_recorded(self) -> None:
-        self.assertEqual(self.result.usage, {"input_tokens": 40, "output_tokens": 20})
+        self.assertEqual(self.result.usage, token_usage(40, 20))
         self.assertGreater(self.result.duration_seconds, 0)
 
     def test_requests_use_research_settings(self) -> None:
         request = self.client.requests[0]
-        self.assertEqual(request["model"], "claude-sonnet-5-5")
+        self.assertEqual(request["model"], "claude-haiku-5-5")  # FR-225a.
         self.assertEqual(request["thinking"], {"type": "adaptive", "display": "summarized"})
         self.assertEqual(request["output_config"], {"effort": "medium"})
-        self.assertEqual(request["fallbacks"], "default")
-        self.assertEqual(request["betas"], ["server-side-fallback-2026-07-01"])
+        self.assertNotIn("fallbacks", request)  # Haiku 5.5 has no refusal fallback.
+        self.assertNotIn("betas", request)
 
     def test_trace_records_each_step(self) -> None:
         steps = self.result.steps
@@ -222,7 +245,8 @@ class HappyPathTests(AgentTestCase):
             write,
             ToolCall(
                 tool="write_file",
-                input={"path": "main.py", "content": "print('hi')\n"},
+                input={"path": "main.py", "content": "print('hi')\n",
+                       "purpose": "Write the program."},
                 output="Wrote 12 bytes to main.py",
                 is_error=False,
             ),
@@ -242,7 +266,6 @@ class HappyPathTests(AgentTestCase):
         self.assertEqual(kinds[-1], "result")
 
 
-@requires_docker
 class LimitAndFailureTests(AgentTestCase):
     def test_step_limit_ends_the_run_with_a_full_result(self) -> None:
         counter = iter(range(1000))
@@ -250,7 +273,8 @@ class LimitAndFailureTests(AgentTestCase):
         def always_tool():
             n = next(counter)
             return response(
-                [tool_use(f"t{n}", "write_file", {"path": "main.py", "content": f"print({n})\n"})],
+                [tool_use(f"t{n}", "write_file", {"path": "main.py", "content": f"print({n})\n",
+                                                  "purpose": "Rewrite it."})],
                 "tool_use",
             )
 
@@ -278,10 +302,12 @@ class LimitAndFailureTests(AgentTestCase):
 
     def test_api_error_is_reported_not_raised(self) -> None:
         request = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
-        client = FakeClient([anthropic.APIConnectionError(request=request)])
+        response_401 = httpx2.Response(401, request=request)
+        client = FakeClient([anthropic.AuthenticationError(
+            "invalid x-api-key", response=response_401, body=None)])
         result = self.make_agent(client).run("Anything")
         self.assertEqual(result.status, "error")
-        self.assertIn("Connection error", result.error)
+        self.assertIn("invalid x-api-key", result.error)
 
     def test_empty_task_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
@@ -291,7 +317,8 @@ class LimitAndFailureTests(AgentTestCase):
         client = FakeClient(
             [
                 response(
-                    [tool_use("t1", "write_file", {"path": "main.py", "content": "print(42)\n"})],
+                    [tool_use("t1", "write_file", {"path": "main.py", "content": "print(42)\n",
+                                                   "purpose": "Write it."})],
                     "tool_use",
                 ),
                 response([text_block("Wrote it.")], "end_turn"),
@@ -304,13 +331,13 @@ class LimitAndFailureTests(AgentTestCase):
 def write_then_finish_script(path: str) -> list:
     return [
         response(
-            [tool_use("w", "write_file", {"path": path, "content": "print('ok')\n"})], "tool_use"
+            [tool_use("w", "write_file", {"path": path, "content": "print('ok')\n",
+                                          "purpose": "Write it."})], "tool_use"
         ),
         response([text_block("Done.")], "end_turn"),
     ]
 
 
-@requires_docker
 class SharedWorkspaceTests(AgentTestCase):
     def test_runs_given_the_same_workspace_build_in_one_folder(self) -> None:
         shared = Path(self._tmp.name) / "shared"
@@ -336,7 +363,6 @@ class SharedWorkspaceTests(AgentTestCase):
         self.assertEqual(Path(result.workspace).name, result.run_id)
 
 
-@requires_docker
 class McpFileToolTests(AgentTestCase):
     def test_every_file_tool_call_goes_through_the_mcp_session(self) -> None:
         result = self.make_agent(FakeClient(happy_path_script())).run("Write main.py")
@@ -363,7 +389,8 @@ class McpFileToolTests(AgentTestCase):
     def test_write_into_tests_comes_back_as_a_tool_error(self) -> None:
         script = [
             response(
-                [tool_use("t1", "write_file", {"path": "tests/test_x.py", "content": "x"})],
+                [tool_use("t1", "write_file", {"path": "tests/test_x.py", "content": "x",
+                                               "purpose": "Edit a test."})],
                 "tool_use",
             ),
             response([text_block("Done.")], "end_turn"),
@@ -388,6 +415,9 @@ class McpFileToolTests(AgentTestCase):
 
 
 class SandboxRequiredTests(AgentTestCase):
+    # These check the real "no Docker" refusal, so the sandbox stand-in must stay out.
+    real_sandbox = True
+
     def test_agent_refuses_to_start_without_docker(self) -> None:
         with mock.patch("tools.python_exec.shutil.which", return_value=None):
             with self.assertRaises(SandboxUnavailableError):
@@ -399,6 +429,65 @@ class SandboxRequiredTests(AgentTestCase):
                 contextlib.redirect_stderr(stderr):
             self.assertEqual(coder_agent.main(["Write a.py"]), 2)
         self.assertIn("Docker is required", stderr.getvalue())
+
+
+class ToolInputValidationTests(AgentTestCase):
+    """A tool call whose input fails its ``TypedDict`` is never run (FR-219a)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        patcher = mock.patch.object(coder_agent, "ensure_sandbox", lambda image: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.config = replace(self.config, max_steps=5)
+
+    def test_invalid_and_unknown_tool_calls_are_errors_and_the_loop_goes_on(self) -> None:
+        client = sc.ScriptedClaude([
+            sc.tool_use_reply([("write_file", {"path": 3, "content": "x", "purpose": "p"})]),
+            sc.tool_use_reply([("exec_python", {"purpose": "Run it."})]),
+            sc.tool_use_reply([("rm_rf", {"path": "/", "purpose": "Clean up."})]),
+            sc.text_reply("Done."),
+            sc.text_reply(SUMMARY),
+        ])
+        result = self.make_agent(client).run("Write main.py")
+
+        results = [
+            block for request in client.requests for message in request["messages"]
+            if message["role"] == "user" and isinstance(message["content"], list)
+            for block in message["content"] if block.get("type") == "tool_result"
+        ]
+        texts = list(dict.fromkeys(block["content"] for block in results))
+        self.assertTrue(all(block["is_error"] for block in results))
+        self.assertEqual(len(texts), 3)
+        self.assertTrue(texts[0].startswith("Invalid tool input: $.path: expected str"))
+        self.assertTrue(texts[1].startswith("Invalid tool input: $: missing required key"))
+        self.assertEqual(texts[2], "Unknown tool: rm_rf")
+        writes = [call for session in FakeFileTools.sessions for call in session.calls
+                  if call[0] == "write_file"]
+        self.assertEqual(writes, [])
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(client.remaining, 0)
+        recorded = [action for step in result.steps for action in step.actions]
+        self.assertTrue(all(action.is_error for action in recorded))
+
+
+class FullyMockedTests(unittest.TestCase):
+    """The Coder's unit tests need no Docker: none of them is skipped without it."""
+
+    def test_nothing_in_this_module_skips_without_docker(self) -> None:
+        loader = unittest.defaultTestLoader
+        suite = unittest.TestSuite(
+            loader.loadTestsFromTestCase(case) for case in (
+                HappyPathTests, LimitAndFailureTests, SharedWorkspaceTests,
+                McpFileToolTests, ToolInputValidationTests,
+            )
+        )
+        result = unittest.TestResult()
+        with mock.patch("shutil.which", return_value=None):
+            suite.run(result)
+        self.assertEqual(result.skipped, [])
+        self.assertEqual(result.errors + result.failures, [])
+        self.assertGreater(result.testsRun, 15)
 
 
 class ConfigTests(unittest.TestCase):

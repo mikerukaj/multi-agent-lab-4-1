@@ -227,11 +227,14 @@ uncached input. Per call, `prompt_tokens = input + cache_creation + cache_read` 
 
 | Model | Input | Output | Cache read | Cache write 5m | Cache write 1h | Long-context rule |
 |---|---|---|---|---|---|---|
-| `claude-sonnet-5-5` | $2.00 | $10.00 | $0.20 | $2.50 | $4.00 | none |
+| `claude-sonnet-5-5` | $2.00 | $10.00 | $0.10 | $2.50 | $4.00 | none |
 | `claude-haiku-5-5` | $0.10 | $0.50 | $0.01 | $0.125 | $0.20 | prompt > 100K tokens: $0.50 / $2.50 / $0.05 / $0.625 / $1.00 |
 
-All prices are per million tokens. The table carries `"version": "2026-10-06"` and a
-source note, and is checked against the live pricing page at implementation. The
+All prices are per million tokens. The table carries `"version": "2026-10-20"` and a
+source note. Checked against the live pricing page on 2026-10-20 (T063): Sonnet 5.5's
+cache read is $0.10 (0.05x input), not the $0.20 first recorded here; every Haiku 5.5
+rate, including the over-100K-token tier, matched. A Haiku request's prompt length
+counts input, cache-read and cache-write tokens. The
 5m/1h split comes from `usage.cache_creation.ephemeral_5m_input_tokens` and
 `ephemeral_1h_input_tokens` when present. Otherwise the configured TTL is used.
 
@@ -376,7 +379,7 @@ Generated program output inside the workspace is not changed (FR-219).
 **Decision**: the application image (`Dockerfile`):
 
 - **Base**: `python:3.12-slim@sha256:a6e34c…` (the same digest the sandbox uses).
-- **Docker CLI**: `COPY --from=docker:26.1.3-cli@sha256:<digest> /usr/local/bin/docker /usr/local/bin/docker`.
+- **Docker CLI**: `COPY --from=docker:26.1.3-cli@sha256:46f45f59366d443fec0ecb4a44fa4fb65f11b3305ca6b138edc176d8971e05b4 /usr/local/bin/docker /usr/local/bin/docker`.
   This gives a pinned static CLI and no apt repository.
 - **Python packages**: `pip install --no-cache-dir -r requirements.txt`, every version
   pinned.
@@ -390,7 +393,7 @@ Generated program output inside the workspace is not changed (FR-219).
 
 `docker-compose.yml`:
 
-- **`chroma`**: `chromadb/chroma:1.5.9@sha256:<index digest>`, the same version as the
+- **`chroma`**: `chromadb/chroma:1.5.9@sha256:1e0b73a187a28757c572acba508c46f48c9e8b0acaf5c20e6d95cdedce1acdf6`, the same version as the
   client package. The tag was verified on Docker Hub on 2026-10-19. It has a
   `chroma-data` volume and no host port publishing.
   - Health check: `GET /api/v2/heartbeat` via
@@ -415,6 +418,21 @@ Generated program output inside the workspace is not changed (FR-219).
     path.
   - Command: `command: ["${TEAM_REQUIREMENT:-<default realistic requirement>}"]`, so
     `docker compose up` runs the pipeline once and exits.
+
+**Pinned digests (T081, looked up 2026-10-20 from the Docker Hub registry API, since
+this machine has no Docker)**:
+
+| Image | Index digest |
+|---|---|
+| `chromadb/chroma:1.5.9` | `sha256:1e0b73a187a28757c572acba508c46f48c9e8b0acaf5c20e6d95cdedce1acdf6` |
+| `docker:26.1.3-cli` | `sha256:46f45f59366d443fec0ecb4a44fa4fb65f11b3305ca6b138edc176d8971e05b4` |
+| `python:3.12-slim` | kept at the sandbox's existing `sha256:a6e34c…` pin (the tag has since moved to `sha256:2259debd…`) |
+
+The pinned Chroma image's amd64 layers contain `/usr/bin/bash` and `/usr/bin/sh` but no
+`curl`, `wget` or `python3`, and the image defines no health check of its own
+(entrypoint `dumb-init -- chroma run /config.yaml`). The Compose health check is
+therefore the bash `/dev/tcp` probe above. That the probe answers on a running
+container is still to be confirmed with Docker (T084).
 
 **Why the same-path workspace mount**: the agent container asks the host engine to bind
 mount the workspace into each sandbox. The engine resolves that path on the host, so
@@ -454,6 +472,15 @@ The items checked:
 The exit code is 0 when all items pass and 2 otherwise. `run_team` runs the same checks
 before the first model call (FR-231, US4 scenario 4). The Compose health check for the
 agent itself is not needed, because it is a one-shot job.
+
+**LangSmith capture hook (confirmed against `langsmith 0.14.11` at implementation)**:
+the tracer builds spans directly with `RunTree` (explicit parents, `create_child`,
+`RunTree.from_headers` on the broker threads), and `RunTree.post()` / `.patch()` call
+the client's `create_run` / `update_run`. Tests therefore record spans with a
+`MagicMock(spec=langsmith.Client)` and rebuild the tree from those two calls'
+keyword arguments (`tests/fakes/recording_tracer.py`); nothing is sent. Malformed
+headers make `RunTree.from_headers` raise `ValueError`, which the tracer turns into one
+warning and a parentless span.
 
 ## R18. Test strategy
 

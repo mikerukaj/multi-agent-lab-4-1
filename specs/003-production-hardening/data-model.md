@@ -152,7 +152,7 @@ Event types: `run_start`, `run_end`, `stage_start`, `stage_end`, `model_call`,
 | `saved_at` | ISO-8601 str | |
 | `stage` | `Stage` | last completed stage |
 | `next_node` | str | where `resume` routes |
-| `state` | `TeamState` | redacted; `resume_from` is `None` |
+| `state` | `TeamState` | redacted; `resume_from` is `None`. Its `test_suite` is QA's own copy of its tests (FR-213), restored on resume so QA's tamper check still works |
 | `settings` | {models, efforts, max_iterations, max_steps, exec_timeout, reflection_rounds, prompt_cache_ttl, budget_usd} | compared on resume (FR-213c) |
 | `ledger` | dict[`AgentName`, `AgentUsage`] | carried forward |
 | `workspace` | dict[path, {`b64`: str, `mode`: int}] | full snapshot incl. `tests/`, `.qa/` |

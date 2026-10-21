@@ -7,11 +7,14 @@ Research: R18. Requirements: FR-235–FR-239, directive 5.
 ```bash
 scripts/test.sh            # = coverage run -m unittest discover -s tests -t . -v
                            #   && coverage report --fail-under=85
+                           # (the gate is added by T091; before that it only reports)
 ```
 
 - The exit status alone signals the result, including a coverage shortfall. It runs the
   same way on the host and inside the application image:
-  `docker compose run --rm --entrypoint scripts/test.sh agent`.
+  the `test` image stage (`docker build --target test`), with the `docker run` line in
+  [deployment.md](deployment.md) "Running the suite in the image". The `runtime` image
+  has no `coverage`.
 - `requirements-dev.txt`: `coverage==7.16.2`.
 - `.coveragerc`: `source = agents, orchestration, tools, messaging, observability, resilience, cost, benchmarks`.
   `omit = tests/*`.

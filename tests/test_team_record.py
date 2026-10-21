@@ -12,6 +12,7 @@ from agents.pm_agent import PMAgent, PMConfig
 from orchestration import team
 from orchestration.team import format_update, run_team
 from tests.team_fakes import (
+    token_usage,
     FakeCoder,
     FakePMClient,
     FakeQA,
@@ -68,7 +69,7 @@ class RunRecordTests(unittest.TestCase):
         )
         # PM and Coder: 130 in, 65 out; one reflection (20 in, 10 out);
         # QA: one scripted iteration (100 in, 50 out).
-        self.assertEqual(final["usage"], {"input_tokens": 250, "output_tokens": 125})
+        self.assertEqual(final["usage"], token_usage(250, 125))
         self.assertEqual(Path(final["workspace"]).parent, self.root.resolve())
         self.assertEqual(json.loads(json.dumps(final)), final)
 
@@ -150,6 +151,7 @@ class CliTests(unittest.TestCase):
         stdout, stderr = io.StringIO(), io.StringIO()
         coder_agent = mock.Mock(side_effect=coder_error)
         patches = [
+            mock.patch.object(team, "check_health", return_value={"ok": True, "items": []}),
             mock.patch.object(team, "PMAgent"),
             mock.patch.object(team, "CoderAgent", coder_agent),
             mock.patch.object(team, "QAAgent"),

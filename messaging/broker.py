@@ -251,6 +251,8 @@ class A2ABroker:
         except SkillRejected as error:
             return "TASK_STATE_REJECTED", str(error)
         except SkillFailed as error:
+            if error.artifacts:
+                task["artifacts"] = _checked_artifacts(error.artifacts)
             return "TASK_STATE_FAILED", str(error)
         except A2AError as error:
             return "TASK_STATE_FAILED", error.detail

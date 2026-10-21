@@ -6,8 +6,12 @@ records every item and a summary, plus a fingerprint of the benchmark file so la
 evaluations can tell whether they are comparable.
 See specs/002-qa-feedback-loop-mcp/contracts/benchmark.md.
 
+Production hardening (003) adds the cost of every item and in total, and a comparison
+with a baseline results file (SC-205, SC-205a).
+
 Usage:
     python -m benchmarks.run_benchmark [--only ID[,ID...]] [--max-iterations N] [--out DIR]
+        [--baseline FILE]
 """
 
 import argparse
@@ -16,6 +20,7 @@ import json
 import os
 import re
 import shutil
+import statistics
 import sys
 import tempfile
 import time
@@ -27,7 +32,10 @@ from dotenv import load_dotenv
 
 from agents.coder_agent import CoderAgent, CoderConfig
 from agents.pm_agent import PMAgent, PMConfig
+from agents.llm import LARGE_MODEL
 from agents.qa_agent import QAAgent, QAConfig
+from cost.pricing import DEFAULT_PRICE_TABLE, load_price_table
+from orchestration.services import RunServices
 from orchestration.team import check_max_iterations, max_iterations_from_env, run_team
 from tools.python_exec import SandboxUnavailableError, ensure_sandbox
 
@@ -91,8 +99,59 @@ def record_for(entry: dict, final: dict | None, error: str | None, duration: flo
         "duration_seconds": round(duration, 3),
         "input_tokens": usage["input_tokens"],
         "output_tokens": usage["output_tokens"],
+        "cost_usd": final.get("cost_usd") if final else None,
+        "cost_by_agent": {
+            agent: entry["cost_usd"] for agent, entry in final.get("agent_usage", {}).items()
+        } if final else {},
+        "cost_report": final.get("cost_report_path") if final else None,
         "error": error or (final.get("error") if final else None),
     }
+
+
+def item_cost(record: dict) -> float | None:
+    """An item's cost; a pre-003 record (tokens only) is priced uncached on the large model,
+    as the baseline was (T003)."""
+    if record.get("cost_usd") is not None:
+        return record["cost_usd"]
+    if "cost_usd" in record:
+        return None  # Measured, but a serving model had no price.
+    prices = load_price_table(DEFAULT_PRICE_TABLE)["models"][LARGE_MODEL]
+    return round((record["input_tokens"] * prices["input"]
+                  + record["output_tokens"] * prices["output"]) / 1_000_000, 6)
+
+
+def cost_totals(records: list[dict]) -> dict:
+    """Total and mean cost per item, and the median duration (contracts/cli.md).
+
+    Items whose cost is unknown (a crashed run, or an unpriced model) are left out of
+    the cost totals; ``items_costed`` says how many were counted.
+    """
+    costs = [cost for cost in map(item_cost, records) if cost is not None]
+    total = round(sum(costs), 6) if costs else None
+    return {
+        "items_costed": len(costs),
+        "total_cost_usd": total,
+        "mean_cost_usd": round(total / len(costs), 6) if costs else None,
+        "median_duration_seconds": (
+            statistics.median(record["duration_seconds"] for record in records)
+            if records else None
+        ),
+    }
+
+
+def baseline_lines(totals: dict, baseline: dict) -> list[str]:
+    """Compare this run with a baseline results file (SC-205 cost, SC-205a duration)."""
+    before = cost_totals(baseline["records"])
+    lines = []
+    if before["mean_cost_usd"] and totals["mean_cost_usd"] is not None:
+        change = (totals["mean_cost_usd"] - before["mean_cost_usd"]) / before["mean_cost_usd"]
+        lines.append(f"cost per item: ${before['mean_cost_usd']:.3f} → "
+                     f"${totals['mean_cost_usd']:.3f} ({change:+.0%})")
+    if before["median_duration_seconds"] and totals["median_duration_seconds"] is not None:
+        delta = totals["median_duration_seconds"] - before["median_duration_seconds"]
+        lines.append(f"median duration: {before['median_duration_seconds']:.0f} s → "
+                     f"{totals['median_duration_seconds']:.0f} s ({delta:+.0f} s)")
+    return lines
 
 
 def _did_not_pass(test_run: dict) -> bool:
@@ -136,16 +195,10 @@ def main(argv: list[str] | None = None, run_team=run_team, make_agents=build_age
     """Run the benchmark; 0 if a full run meets SC-102 and SC-103, 1 otherwise, 2 for
     usage errors."""
     load_dotenv()
-    parser = argparse.ArgumentParser(
-        prog="python -m benchmarks.run_benchmark",
-        description="Run the team on the fixed benchmark and score SC-102 and SC-103.",
-    )
-    parser.add_argument("--only", help="comma-separated benchmark ids to run (a partial run)")
-    parser.add_argument("--max-iterations", type=int, help="most QA reviews per run (1-10)")
-    parser.add_argument("--out", type=Path, default=RESULTS_DIR, help="results folder")
-    args = parser.parse_args(argv)
+    args = _parse_args(argv)
     try:
         entries, max_iterations = _plan(args)
+        baseline = _read_baseline(args.baseline)
         if make_agents is build_agents:
             _preflight()
     except ValueError as error:
@@ -169,12 +222,28 @@ def main(argv: list[str] | None = None, run_team=run_team, make_agents=build_age
         "partial": partial,
         "records": records,
         "summary": summary,
+        "totals": cost_totals(records),
     }
     _warn_if_not_comparable(args.out, result["fingerprint"])
     path = _write_results(args.out, result)
     _print_summary(records, summary, path)
+    for line in baseline_lines(result["totals"], baseline) if baseline else []:
+        print(f"  {line}", file=sys.stderr)
     both_met = summary["sc_102"]["met"] and summary["sc_103"]["met"]
     return 0 if not partial and both_met else 1
+
+
+def _parse_args(argv: list[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="python -m benchmarks.run_benchmark",
+        description="Run the team on the fixed benchmark and score SC-102 and SC-103.",
+    )
+    parser.add_argument("--only", help="comma-separated benchmark ids to run (a partial run)")
+    parser.add_argument("--max-iterations", type=int, help="most QA reviews per run (1-10)")
+    parser.add_argument("--out", type=Path, default=RESULTS_DIR, help="results folder")
+    parser.add_argument("--baseline", type=Path,
+                        help="a results file to compare cost and duration against")
+    return parser.parse_args(argv)
 
 
 def _plan(args) -> tuple[list[dict], int]:
@@ -190,6 +259,23 @@ def _plan(args) -> tuple[list[dict], int]:
     if args.max_iterations is not None:
         return entries, check_max_iterations(args.max_iterations)
     return entries, max_iterations_from_env()
+
+
+def _read_baseline(path: Path | None) -> dict | None:
+    """Read a baseline results file.
+
+    Raises:
+        ValueError: if it can't be read or has no records.
+    """
+    if path is None:
+        return None
+    try:
+        baseline = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise ValueError(f"cannot read the baseline {path}: {error}") from error
+    if not baseline.get("records"):
+        raise ValueError(f"the baseline {path} has no records")
+    return baseline
 
 
 def _preflight() -> None:
@@ -212,7 +298,7 @@ def _run_item(entry: dict, run_team, make_agents, max_iterations: int, session: 
         workspace_root = Path("workspace") / f"benchmark-{session}"
         final = run_team(
             entry["requirement"], pm, coder, workspace_root, None,
-            qa=qa, max_iterations=max_iterations,
+            qa=qa, max_iterations=max_iterations, services=RunServices.create(),
         )
     except Exception as exc:  # One broken item must not stop the evaluation.
         error = f"{type(exc).__name__}: {exc}"

@@ -24,7 +24,10 @@ from agents.qa_agent import (
     normalise_findings,
     verdict_for,
 )
+from tests.fakes import assert_no_live_dependencies
+from tests.fakes import scripted_claude as sc
 from tests.schema_check import CONTRACT, FIXTURE, assert_matches_findings_schema, load_schema
+from orchestration.services import RunServices
 from tests.team_fakes import FakeFileTools, scripted_test_run
 from tools.mcp_client import McpUnavailableError
 
@@ -38,6 +41,10 @@ def add(a: int, b: int) -> int:
     """Add two numbers."""
     marker = "{BODY_MARKER}"
     return a + b
+
+
+def setUpModule() -> None:
+    assert_no_live_dependencies()
 
 
 class Calculator:
@@ -144,7 +151,11 @@ class FakeClient:
         return item
 
     def user_text(self, index: int) -> str:
-        return self.requests[index]["messages"][0]["content"]
+        """The request's user message as text (its content blocks joined)."""
+        content = self.requests[index]["messages"][0]["content"]
+        if isinstance(content, str):
+            return content
+        return "\n\n".join(block["text"] for block in content)
 
 
 class FakeRunner:
@@ -154,8 +165,9 @@ class FakeRunner:
         self._runs = list(runs)
         self.calls = 0
 
-    def __call__(self, workspace: Path, timeout_seconds: float, image: str) -> dict:
+    def __call__(self, workspace: Path, timeout_seconds: float, image: str, **kwargs) -> dict:
         self.calls += 1
+        self.kwargs = kwargs
         return self._runs.pop(0) if len(self._runs) > 1 else self._runs[0]
 
 
@@ -363,7 +375,9 @@ class IterationOneTests(QATestCase):
         request = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
         for script, text in (
             ([reply(stop_reason="refusal")], "declined"),
-            ([anthropic.APIConnectionError(request=request)], "Model call failed"),
+            ([anthropic.AuthenticationError(
+                "invalid x-api-key", response=httpx2.Response(401, request=request), body=None
+            )], "Model call failed"),
             ([self.bad_json_reply()] * 2, "not valid JSON"),
             ([reply(stop_reason="max_tokens")] * 2, "cut off at the output limit"),
         ):
@@ -539,6 +553,67 @@ class LaterIterationTests(QATestCase):
         self.assertEqual(writes, [])
 
 
+class DependencyFailureTests(QATestCase):
+    """QA reports a model call it can't make in the iteration's ``failure``."""
+
+    def test_an_unavailable_model_is_reported_with_its_failure(self) -> None:
+        result = self.run_qa([sc.overloaded_error()] * 4, [scripted_test_run()])
+        self.assertTrue(result.error.startswith("Model service unavailable"), result.error)
+        self.assertEqual(result.failure["kind"], "temporary")
+        self.assertEqual(result.verdict, "fix_needed")
+        self.assertEqual(result.to_dict()["failure"]["dependency"], "anthropic")
+
+    def test_a_permanent_model_failure_is_a_model_call_failure(self) -> None:
+        result = self.run_qa([sc.auth_error()], [scripted_test_run()])
+        self.assertTrue(result.error.startswith("Model call failed"), result.error)
+        self.assertEqual(result.failure["kind"], "permanent")
+
+
+class ReplyValidationTests(QATestCase):
+    """A QA reply that fails its ``TypedDict`` is rejected before anything is written."""
+
+    def writes(self) -> list[str]:
+        return [
+            arguments["path"] for session in FakeFileTools.sessions
+            for name, arguments in session.calls if name == "write_file"
+        ]
+
+    def assert_malformed(self, result, expected: str) -> None:
+        self.assertTrue(result.error.startswith("Malformed QA reply: "), result.error)
+        self.assertIn(expected, result.error)
+        self.assertEqual(result.verdict, "fix_needed")
+
+    def test_a_test_file_missing_its_criteria_is_rejected_twice_then_fails(self) -> None:
+        bad = {key: value for key, value in TEST_FILE.items() if key != "criteria"}
+        result = self.run_qa([write_tests_reply(bad)] * 2, [scripted_test_run()])
+        self.assert_malformed(result, "$.test_files[0]: missing required key 'criteria'")
+        self.assertEqual(len(self.client.requests), 2)
+        self.assertEqual(self.writes(), [])
+
+    def test_a_dispute_decision_outside_its_set_is_rejected(self) -> None:
+        (self.workspace / "tests" / "stale_test.py").unlink()
+        (self.workspace / "tests" / "test_app.py").write_text(SUITE_CONTENT, encoding="utf-8")
+        responses = [{"finding_id": "F1-1", "action": "disputed", "reason": "Not in the spec."}]
+        result = self.run_qa(
+            [disputes_reply("critical")] * 2, [scripted_test_run()], iteration=2,
+            test_suite={TEST_FILE["path"]: SUITE_CONTENT},
+            previous_findings=previous_findings(), responses=responses,
+        )
+        self.assert_malformed(result, "$.decisions[0].decision: 'critical' is not one of")
+        self.assertEqual(self.writes(), [])
+
+    def test_a_non_integer_finding_index_is_rejected(self) -> None:
+        regression = {**TEST_FILE, "path": "tests/test_regression.py", "finding_index": "0"}
+        bad_review = review_reply([raw_finding()], [regression])
+        result = self.run_qa(
+            [write_tests_reply(), bad_review, bad_review], [scripted_test_run()]
+        )
+        self.assert_malformed(
+            result, "$.regression_tests[0].finding_index: expected int, got str"
+        )
+        self.assertEqual(self.writes(), ["tests/test_app.py"])
+
+
 class NormaliseTests(unittest.TestCase):
     def test_kind_and_rule_set_the_severity(self) -> None:
         findings = normalise_findings(
@@ -583,6 +658,21 @@ class FinalReportTests(QATestCase):
         for text in ("iteration_limit", "F1-1", "Return a + b.", "Advisory", "#1:"):
             self.assertIn(text, markdown)
         self.assertEqual(FakeFileTools.sessions[-1].calls[0][0], "write_file")
+
+    def test_secrets_in_the_report_are_redacted(self) -> None:
+        secret = "sk-ant-api03-reportsecret0123456789"
+        services = RunServices.create(env={"MY_API_KEY": "plantedvalue123"}, response_cache=None)
+        agent = QAAgent(QAConfig(), client=FakeClient([]), run_tests=FakeRunner([{}]),
+                        file_tools=FakeFileTools, services=services)
+        request = self.request()
+        finding = {**request["iterations"][-1]["findings"][0],
+                   "problem": f"Leaks {secret} and plantedvalue123."}
+        request["iterations"][-1] = {**request["iterations"][-1], "findings": [finding]}
+        agent.final_report(request)
+        text = (self.workspace / ".qa" / "report.md").read_text(encoding="utf-8")
+        self.assertNotIn(secret, text)
+        self.assertNotIn("plantedvalue123", text)
+        self.assertIn("[REDACTED]", text)
 
     def test_mcp_failure_leaves_the_report_path_empty(self) -> None:
         class Broken(FakeFileTools):

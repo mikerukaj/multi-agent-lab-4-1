@@ -56,4 +56,15 @@
   test layers (FR-235a–c, US5 scenario 5). The tracing exclusion and the 4-retry default
   were removed. LangSmith, Chroma, `TypedDict` and Compose are named because the user
   named them; other new-work choices stay in the plan. All items still pass.
+- Iteration 4 (2026-10-20, after `/speckit-analyze`): FR-205 now says which end reason a
+  permanent failure gives (the agent's own, exit 1, not resumable) and that only
+  exhausted temporary failures or open circuits end `dependency_unavailable`. US1
+  scenario 4 and the file-tool edge case now say restarts are bounded by the FR-204
+  retry limit (D3), instead of "once" and "the MCP-unavailable cause". There are no
+  conflicting lines left between FR-205, FR-206, FR-209, FR-213b and US1 scenarios 3, 4
+  and 9. All items still pass.
+- Iteration 5 (2026-10-20, rest of the `/speckit-analyze` findings): QA's final report is
+  described as making no model call (FR-223, FR-225a, US3 narrative and scenario 2), and
+  tracing has one root per run attempt (FR-214a, US2 scenario 6), matching SC-214. All
+  items still pass.
 - Items marked incomplete require spec updates before `/speckit-clarify` or `/speckit-plan`

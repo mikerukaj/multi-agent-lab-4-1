@@ -3,16 +3,26 @@
 Every run gets a fresh container that has no network, no secrets, a read-only
 filesystem apart from the run's own workspace, no Linux capabilities, and
 memory, CPU and process limits. Generated code never runs on the host.
+
+Every container is labelled with its run ID and owner (host and process), so a
+run's containers can be killed on a stop signal and those left by dead runs
+removed at start-up (FR-211). With a guard, a container that Docker itself fails
+to start is retried; the generated code's own exit codes and timeouts never are
+(FR-207).
 """
 
 import os
 import secrets
 import shutil
+import socket
 import subprocess
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from orchestration.checkpoint import is_locked, run_dir
+from resilience.circuit import DependencyGuard, GuardFailure
+from resilience.classify import classify
 from tools.file_tools import resolve_in_workspace
 
 SANDBOX_BASE_IMAGE = (
@@ -29,6 +39,8 @@ SANDBOX_LIMITS = [
 ]
 OUTPUT_LIMIT_CHARS = 10_000
 TRUNCATION_MARKER = "\n[truncated]"
+RUN_ID_LABEL = "multi-agent-lab.run_id"
+OWNER_LABEL = "multi-agent-lab.owner"
 
 EXEC_PYTHON_TOOL = {
     "name": "exec_python",
@@ -50,7 +62,14 @@ EXEC_PYTHON_TOOL = {
 
 
 class SandboxUnavailableError(RuntimeError):
-    """Raised when Docker, which every code run depends on, cannot be used."""
+    """Raised when Docker, which every code run depends on, cannot be used.
+
+    ``failure`` is the structured ``DependencyFailure`` when a guarded run gave up.
+    """
+
+    def __init__(self, message: str, failure: dict | None = None) -> None:
+        super().__init__(message)
+        self.failure = failure
 
 
 @dataclass
@@ -63,10 +82,15 @@ class ExecutionResult:
     stderr: str
     timed_out: bool
     duration_seconds: float
+    failure: dict | None = None
+    """The ``DependencyFailure`` when the sandbox could not be used at all."""
 
     def to_dict(self) -> dict:
-        """Return a JSON-serialisable copy of this result."""
-        return asdict(self)
+        """Return a JSON-serialisable copy of this result (``failure`` only when set)."""
+        data = asdict(self)
+        if data["failure"] is None:
+            del data["failure"]
+        return data
 
 
 def ensure_sandbox(image: str = SANDBOX_IMAGE) -> None:
@@ -115,12 +139,48 @@ def _build_sandbox_image() -> None:
 
 
 def exec_python(
-    workspace: Path, path: str, timeout_seconds: float, image: str = SANDBOX_IMAGE
+    workspace: Path,
+    path: str,
+    timeout_seconds: float,
+    image: str = SANDBOX_IMAGE,
+    guard: DependencyGuard | None = None,
+    run_id: str = "",
 ) -> ExecutionResult:
     """Run ``path`` in a new sandbox container that sees only ``workspace``.
 
     A run that exceeds ``timeout_seconds`` (container start-up included) is
-    killed and reported with ``timed_out=True``.
+    killed and reported with ``timed_out=True``. With a ``guard``, a container
+    Docker fails to start is retried; if the guard gives up, the result has
+    ``exit_code=None`` and ``failure`` set.
+
+    Raises:
+        ValueError: if ``path`` is outside the workspace or not a ``.py`` file.
+        FileNotFoundError: if ``path`` does not exist.
+    """
+    target = _python_file(workspace, path)
+
+    def attempt() -> subprocess.CompletedProcess:
+        name = f"coder-exec-{secrets.token_hex(6)}"
+        command = sandbox_command(workspace, target, name, image, run_id)
+        return run_container(command, name, timeout_seconds)
+
+    started = time.monotonic()
+    outcome = guarded_run(attempt, guard)
+    duration = round(time.monotonic() - started, 3)
+    if isinstance(outcome, GuardFailure):
+        return ExecutionResult(path, None, "", "", False, duration, failure=outcome.failure)
+    return ExecutionResult(
+        path=path,
+        exit_code=outcome.returncode,
+        stdout=cap_output(outcome.stdout),
+        stderr=cap_output(outcome.stderr),
+        timed_out=outcome.returncode is None,
+        duration_seconds=duration,
+    )
+
+
+def _python_file(workspace: Path, path: str) -> Path:
+    """The workspace file ``path`` names, checked to be an existing ``.py`` file.
 
     Raises:
         ValueError: if ``path`` is outside the workspace or not a ``.py`` file.
@@ -131,41 +191,53 @@ def exec_python(
         raise ValueError(f"Not a Python file: {path}")
     if not target.is_file():
         raise FileNotFoundError(f"File not found: {path}")
+    return target
 
-    name = f"coder-exec-{secrets.token_hex(6)}"
-    command = sandbox_command(workspace, target, name, image)
-    started = time.monotonic()
+
+def run_container(command: list[str], name: str, timeout_seconds: float):
+    """Run one ``docker run`` command; a run past its time limit is killed.
+
+    Returns a ``CompletedProcess`` with the raw output bytes, and ``returncode``
+    ``None`` when the run timed out.
+    """
     process = subprocess.Popen(
         command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
     try:
         stdout, stderr = process.communicate(timeout=timeout_seconds)
-        exit_code, timed_out = process.returncode, False
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
     except subprocess.TimeoutExpired:
         kill_container(name)
         stdout, stderr = process.communicate()
-        exit_code, timed_out = None, True
-
-    return ExecutionResult(
-        path=path,
-        exit_code=exit_code,
-        stdout=cap_output(stdout),
-        stderr=cap_output(stderr),
-        timed_out=timed_out,
-        duration_seconds=round(time.monotonic() - started, 3),
-    )
+        return subprocess.CompletedProcess(command, None, stdout, stderr)
 
 
-def locked_down_run(name: str, workspace: Path, extra_volumes: list[str] = ()) -> list[str]:
+def guarded_run(attempt, guard: DependencyGuard | None):
+    """Run ``attempt`` through ``guard`` (when given), retrying Docker start failures."""
+    if guard is None:
+        return attempt()
+    return guard.call(attempt, classify_result=lambda outcome: classify(outcome, "sandbox"))
+
+
+def run_labels(run_id: str) -> list[str]:
+    """The ``--label`` flags that tie a container to its run and owner (research R14)."""
+    owner = f"{socket.gethostname()}:{os.getpid()}"
+    return ["--label", f"{RUN_ID_LABEL}={run_id}", "--label", f"{OWNER_LABEL}={owner}"]
+
+
+def locked_down_run(
+    name: str, workspace: Path, extra_volumes: list[str] = (), run_id: str = ""
+) -> list[str]:
     """Return the ``docker run`` prefix shared by every sandbox run (code and tests).
 
     No network, a read-only root, no capabilities, resource limits, the host user,
     the workspace as the only read-write mount (plus ``extra_volumes``), and no
-    environment beyond three harmless variables. The caller appends image and command.
+    environment beyond three harmless variables. The container is labelled with
+    ``run_id`` and its owner. The caller appends image and command.
     """
     volumes = [f"{workspace.resolve()}:{SANDBOX_WORKDIR}:rw", *extra_volumes]
     return [
-        "docker", "run", "--rm", "--name", name,
+        "docker", "run", "--rm", "--name", name, *run_labels(run_id),
         "--network", "none",
         "--read-only", "--tmpfs", "/tmp:rw,size=64m",
         "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
@@ -179,7 +251,9 @@ def locked_down_run(name: str, workspace: Path, extra_volumes: list[str] = ()) -
     ]
 
 
-def sandbox_command(workspace: Path, target: Path, name: str, image: str) -> list[str]:
+def sandbox_command(
+    workspace: Path, target: Path, name: str, image: str, run_id: str = ""
+) -> list[str]:
     """Build the ``docker run`` command for one locked-down, throwaway run.
 
     When QA's ``tests/`` folder exists it is mounted read-only over the workspace,
@@ -188,12 +262,47 @@ def sandbox_command(workspace: Path, target: Path, name: str, image: str) -> lis
     script = target.relative_to(workspace.resolve()).as_posix()
     tests = workspace.resolve() / "tests"
     extra = [f"{tests}:{SANDBOX_WORKDIR}/tests:ro"] if tests.is_dir() else []
-    return [*locked_down_run(name, workspace, extra), image, "python", "-s", script]
+    return [*locked_down_run(name, workspace, extra, run_id), image, "python", "-s", script]
 
 
 def kill_container(name: str) -> None:
     """Kill a running sandbox container by name (used when a run passes its time limit)."""
     _docker(["kill", name])
+
+
+def kill_run_containers(run_id: str) -> list[str]:
+    """Kill every running sandbox container labelled with ``run_id``; return their IDs.
+
+    Used when the run is asked to stop (FR-210). Without Docker there is nothing to kill.
+    """
+    if not run_id or shutil.which("docker") is None:
+        return []
+    listed = _docker(["ps", "-q", "--filter", f"label={RUN_ID_LABEL}={run_id}"])
+    ids = listed.stdout.split()
+    if ids:
+        _docker(["kill", "--signal", "KILL", *ids])
+    return ids
+
+
+def cleanup_stale_containers(workspace_root: Path) -> list[str]:
+    """Remove labelled sandbox containers whose run is no longer going; return their IDs.
+
+    A run is going while its lock is held, so containers of concurrent runs on this
+    host are kept (FR-211, FR-230b). Containers without a run ID (the standalone Coder
+    CLI) are left alone. Without Docker there is nothing to clean up.
+    """
+    if shutil.which("docker") is None:
+        return []
+    template = "{{.ID}} {{.Label \"" + RUN_ID_LABEL + "\"}}"
+    listed = _docker(["ps", "-a", "--filter", f"label={RUN_ID_LABEL}", "--format", template])
+    stale = []
+    for line in listed.stdout.splitlines():
+        container_id, _, run_id = line.partition(" ")
+        if run_id and not is_locked(run_dir(workspace_root, run_id)):
+            stale.append(container_id)
+    if stale:
+        _docker(["rm", "--force", *stale])
+    return stale
 
 
 def _docker(args: list[str], timeout: float = 30) -> subprocess.CompletedProcess:

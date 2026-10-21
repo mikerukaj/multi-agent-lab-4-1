@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:multi-agent-lab:run-event:1",
+  "title": "One line of workspace/.runs/<run_id>/events.jsonl",
+  "description": "Structured run event (spec US2, FR-214–FR-221). Every string value is redacted before writing.",
+  "type": "object",
+  "required": ["ts", "run_id", "agent", "stage", "event", "severity", "outcome"],
+  "additionalProperties": false,
+  "properties": {
+    "ts": {"type": "string", "format": "date-time"},
+    "run_id": {"type": "string"},
+    "agent": {"enum": ["pm", "coder", "qa", "team"]},
+    "stage": {"enum": ["plan", "consolidate", "build", "reflect", "qa_review", "fix", "final_report", "team"]},
+    "event": {
+      "enum": [
+        "run_start", "run_end", "stage_start", "stage_end", "model_call", "tool_call",
+        "sandbox_run", "a2a_exchange", "retry", "restart", "circuit_opened",
+        "circuit_half_open", "circuit_closed", "degraded", "validation_failed",
+        "budget_stop", "checkpoint_saved", "resume", "error", "warning"
+      ]
+    },
+    "severity": {"enum": ["debug", "info", "warning", "error"]},
+    "outcome": {"type": "string", "description": "e.g. ok, failed, retrying, cache_hit, refused, completed, or an end reason."},
+    "iteration": {"type": "integer", "minimum": 1},
+    "task_id": {"type": "string"},
+    "details": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "model": {"type": "string"},
+        "tokens": {
+          "type": "object",
+          "properties": {
+            "input_tokens": {"type": "integer"},
+            "output_tokens": {"type": "integer"},
+            "cache_creation_input_tokens": {"type": "integer"},
+            "cache_read_input_tokens": {"type": "integer"}
+          }
+        },
+        "cost_usd": {"type": ["number", "null"]},
+        "duration_ms": {"type": "integer", "minimum": 0},
+        "operation_ms": {"type": "integer", "minimum": 0},
+        "attempt": {"type": "integer", "minimum": 1},
+        "delay_seconds": {"type": "number", "minimum": 0},
+        "dependency": {"enum": ["anthropic", "mcp", "sandbox", "chroma", "a2a"]},
+        "kind": {"enum": ["temporary", "permanent"]},
+        "circuit": {"enum": ["closed", "open", "half_open"]},
+        "error_type": {"type": "string"},
+        "message": {"type": "string"},
+        "tool": {"type": "string"},
+        "served_from": {"enum": ["live", "cache"]},
+        "reply_type": {"type": "string"},
+        "problems": {"type": "array", "items": {"type": "string"}, "maxItems": 5},
+        "summary": {"type": "object", "description": "RunSummary on run_end."}
+      }
+    }
+  }
+}

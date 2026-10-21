@@ -15,6 +15,8 @@ from pathlib import Path
 
 from benchmarks.run_benchmark import (
     BENCHMARK_FILE,
+    baseline_lines,
+    cost_totals,
     fingerprint,
     load_benchmark,
     main,
@@ -36,7 +38,8 @@ def final_state(status: str = "completed", runs=(), end_reason: str = "complete"
         for n, run in enumerate(runs, start=1)
     ]
     return {"run_id": "r", "status": status, "end_reason": end_reason, "error": None,
-            "iterations": iterations, "usage": {"input_tokens": 10, "output_tokens": 5}}
+            "iterations": iterations, "usage": {"input_tokens": 10, "output_tokens": 5},
+            "cost_usd": 0.12}
 
 
 def record(succeeded: bool, first_failed, duration: float = 60.0) -> dict:
@@ -115,6 +118,42 @@ class RecordTests(unittest.TestCase):
         self.assertFalse(raised["succeeded"])
 
 
+class CostTests(unittest.TestCase):
+    entry = {"id": "stats", "title": "Stats", "requirement": "..."}
+
+    def test_records_carry_the_cost_by_agent_and_the_report(self) -> None:
+        final = {**final_state(runs=[scripted_test_run()]), "cost_usd": 0.42,
+                 "cost_report_path": "docs/cost_reports/r.json",
+                 "agent_usage": {"pm": {"cost_usd": 0.3}, "coder": {"cost_usd": 0.1},
+                                 "qa": {"cost_usd": 0.02}}}
+        item = record_for(self.entry, final, None, 10.0)
+        self.assertEqual(item["cost_usd"], 0.42)
+        self.assertEqual(item["cost_by_agent"], {"pm": 0.3, "coder": 0.1, "qa": 0.02})
+        self.assertEqual(item["cost_report"], "docs/cost_reports/r.json")
+
+    def test_totals_mean_and_median_duration(self) -> None:
+        records = [{"cost_usd": 0.2, "duration_seconds": 100},
+                   {"cost_usd": 0.4, "duration_seconds": 300},
+                   {"cost_usd": None, "duration_seconds": 200}]
+        self.assertEqual(cost_totals(records), {"items_costed": 2, "total_cost_usd": 0.6,
+                                                "mean_cost_usd": 0.3,
+                                                "median_duration_seconds": 200})
+
+    def test_a_pre_feature_baseline_is_priced_from_its_tokens(self) -> None:
+        # The T003 baseline format: tokens only, priced uncached on Sonnet ($2 in, $10 out).
+        baseline = {"records": [
+            {"input_tokens": 100_000, "output_tokens": 10_000, "duration_seconds": 200},
+            {"input_tokens": 200_000, "output_tokens": 20_000, "duration_seconds": 240},
+        ]}
+        self.assertAlmostEqual(cost_totals(baseline["records"])["mean_cost_usd"], 0.45)
+        now = {"items_costed": 2, "total_cost_usd": 0.54, "mean_cost_usd": 0.27,
+               "median_duration_seconds": 210}
+        self.assertEqual(baseline_lines(now, baseline), [
+            "cost per item: $0.450 → $0.270 (-40%)",
+            "median duration: 220 s → 210 s (-10 s)",
+        ])
+
+
 class FakeRuns:
     """Scripted ``run_team`` and agent builder; records what each item was given."""
 
@@ -128,7 +167,10 @@ class FakeRuns:
         self.chroma_paths.append(chroma_path)
         return "pm", "coder", "qa"
 
-    def run_team(self, requirement, pm, coder, workspace_root, on_update, *, qa, max_iterations):
+    def run_team(
+        self, requirement, pm, coder, workspace_root, on_update, *, qa, max_iterations,
+        services=None,
+    ):
         self.requirements.append(requirement)
         self.max_iterations.append(max_iterations)
         outcome = self.outcomes.get(len(self.requirements), "pass")
@@ -189,6 +231,18 @@ class MainTests(unittest.TestCase):
         self.assertTrue(result["partial"])
         self.assertEqual(result["max_iterations"], 3)
         self.assertEqual(result["summary"]["sc_102"]["value"], "not evaluated (partial run)")
+
+    def test_baseline_comparison_is_printed(self) -> None:
+        baseline = self.out / "baseline" / "base.json"
+        baseline.parent.mkdir()
+        baseline.write_text(json.dumps({"records": [
+            {"input_tokens": 100_000, "output_tokens": 10_000, "duration_seconds": 200}
+        ]}), encoding="utf-8")
+        _, err = self.run_main(["--only", "stats", "--baseline", str(baseline)], FakeRuns({}))
+        self.assertIn("cost per item: $0.300 → $0.120 (-60%)", err)
+        self.assertIn("median duration: 200 s →", err)
+        self.assertEqual(self.run_main(["--baseline", str(self.out / "missing.json")],
+                                       FakeRuns({}))[0], 2)
 
     def test_usage_errors_exit_2(self) -> None:
         self.assertEqual(self.run_main(["--only", "no-such-id"], FakeRuns({}))[0], 2)

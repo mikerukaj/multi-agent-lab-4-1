@@ -15,7 +15,9 @@ from unittest import mock
 
 from agents.pm_agent import PMAgent, PMConfig
 from messaging.a2a import SkillRejected
+from observability.events import read_events
 from orchestration import team
+from orchestration.services import RunServices
 from orchestration.team import (
     format_update,
     initial_team_state,
@@ -23,7 +25,10 @@ from orchestration.team import (
     render_fix_brief,
     run_team,
 )
+from tests import TEST_ENV
+from tests.fakes.recording_tracer import recording_tracer
 from tests.team_fakes import (
+    token_usage,
     FakeCoder,
     FakePMClient,
     FakeQA,
@@ -211,7 +216,41 @@ class FeedbackLoopTests(TeamLoopTestCase):
         final, _, _ = self.loop(["fix_needed", "complete"])
         # PM 100/50 + 2 build tasks 2 x 10/5 + 2 reflections 2 x 20/10
         # + 2 QA iterations 2 x 100/50 + 1 fix round 10/5.
-        self.assertEqual(final["usage"], {"input_tokens": 370, "output_tokens": 185})
+        self.assertEqual(final["usage"], token_usage(370, 185))
+
+
+class TracingAcrossA2ATests(TeamLoopTestCase):
+    """One trace per run, even for spans opened on the broker's threads (FR-214a)."""
+
+    def test_qa_and_fix_round_spans_share_the_single_root_trace(self) -> None:
+        tracer, recorder = recording_tracer()
+        services = RunServices.create(env=TEST_ENV, response_cache=None, tracer=tracer)
+        qa = FakeQA([qa_result("fix_needed"), qa_result("complete")])
+        final = run_team(REQUIREMENT, make_pm(), FakeCoder(), self.root, qa=qa,
+                         services=services)
+        self.assertEqual(final["end_reason"], "complete")
+        roots = recorder.roots()
+        self.assertEqual([root["name"] for root in roots], ["team-run"])
+        trace = roots[0]["trace_id"]
+        qa_spans = recorder.named("agent:qa")
+        self.assertEqual(len(qa_spans), 3)  # Two reviews and the final report.
+        fix_spans = [span for span in recorder.named("agent:coder")
+                     if span["metadata"].get("invocation") == "fix"]
+        self.assertEqual(len(fix_spans), 1)
+        for span in qa_spans + fix_spans:
+            self.assertEqual(span["trace_id"], trace)
+            self.assertEqual(recorder.ancestors(span)[-1], "team-run")
+
+    def test_every_a2a_exchange_is_an_event_with_its_stage(self) -> None:
+        services = RunServices.create(env=TEST_ENV, response_cache=None)
+        qa = FakeQA([qa_result("fix_needed"), qa_result("complete")])
+        final = run_team(REQUIREMENT, make_pm(), FakeCoder(), self.root, qa=qa,
+                         services=services)
+        path = self.root / ".runs" / final["run_id"] / "events.jsonl"
+        exchanges = [event for event in read_events(path) if event["event"] == "a2a_exchange"]
+        self.assertEqual([event["stage"] for event in exchanges],
+                         ["qa_review", "fix", "qa_review", "final_report"])
+        self.assertEqual(len(exchanges), len(final["a2a_log"]))
 
 
 class IterationLimitTests(TeamLoopTestCase):
@@ -238,6 +277,8 @@ class IterationLimitTests(TeamLoopTestCase):
             for name in ("PMAgent", "CoderAgent", "QAAgent"):
                 stack.enter_context(mock.patch.object(team, name))
             stack.enter_context(mock.patch.object(team, "run_team", run))
+            stack.enter_context(mock.patch.object(
+                team, "check_health", return_value={"ok": True, "items": []}))
             stack.enter_context(mock.patch.dict("os.environ", env))
             stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
             stack.enter_context(contextlib.redirect_stderr(stderr))

@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:multi-agent-lab:cost-report:1",
+  "title": "Run cost report (docs/cost_reports/<run_id>.json)",
+  "description": "Written atomically at the end of every run, however it ends. A resumed run rewrites the file with cumulative totals. All monetary values are USD; null means the price of a serving model is unknown.",
+  "type": "object",
+  "required": [
+    "schema_version", "run_id", "requirement_summary", "started_at", "ended_at",
+    "status", "end_reason", "price_table_version", "prompt_cache_ttl",
+    "budget_usd", "agents", "total", "attempts", "events_lost"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {"const": 1},
+    "run_id": {"type": "string", "pattern": "^[0-9]{8}-[0-9]{6}-[0-9a-f]{6}$"},
+    "requirement_summary": {"type": "string", "maxLength": 200, "description": "First 200 characters of the requirement, redacted."},
+    "started_at": {"type": "string", "format": "date-time"},
+    "ended_at": {"type": "string", "format": "date-time"},
+    "status": {"enum": ["completed", "failed", "rejected", "error"]},
+    "end_reason": {
+      "enum": [
+        "complete", "iteration_limit", "task_failed", "coder_failed", "reflection_failed",
+        "qa_failed", "a2a_failed", "rejected", "pm_error",
+        "dependency_unavailable", "budget_exceeded", "interrupted", null
+      ]
+    },
+    "price_table_version": {"type": "string"},
+    "prompt_cache_ttl": {"enum": ["5m", "1h", "off"]},
+    "budget_usd": {"type": ["number", "null"], "exclusiveMinimum": 0},
+    "agents": {
+      "type": "object",
+      "required": ["pm", "coder", "qa"],
+      "additionalProperties": false,
+      "properties": {
+        "pm": {"$ref": "#/$defs/agent"},
+        "coder": {"$ref": "#/$defs/agent"},
+        "qa": {"$ref": "#/$defs/agent"}
+      }
+    },
+    "total": {
+      "type": "object",
+      "required": ["model_calls", "prompt_tokens", "completion_tokens", "cache_read_tokens", "cache_write_tokens", "cost_usd"],
+      "additionalProperties": false,
+      "properties": {
+        "model_calls": {"type": "integer", "minimum": 0},
+        "prompt_tokens": {"type": "integer", "minimum": 0},
+        "completion_tokens": {"type": "integer", "minimum": 0},
+        "cache_read_tokens": {"type": "integer", "minimum": 0},
+        "cache_write_tokens": {"type": "integer", "minimum": 0},
+        "cost_usd": {"type": ["number", "null"], "minimum": 0}
+      }
+    },
+    "attempts": {
+      "type": "array",
+      "minItems": 1,
+      "description": "One entry per run attempt (the first run plus each resume).",
+      "items": {
+        "type": "object",
+        "required": ["started_at", "ended_at", "end_reason", "cost_usd"],
+        "additionalProperties": false,
+        "properties": {
+          "started_at": {"type": "string", "format": "date-time"},
+          "ended_at": {"type": "string", "format": "date-time"},
+          "end_reason": {"type": ["string", "null"]},
+          "cost_usd": {"type": ["number", "null"], "minimum": 0}
+        }
+      }
+    },
+    "events_lost": {"type": "boolean"}
+  },
+  "$defs": {
+    "agent": {
+      "type": "object",
+      "required": [
+        "model", "models", "model_calls", "cached_replays", "prompt_tokens",
+        "completion_tokens", "cache_read_tokens", "cache_write_tokens", "cost_usd"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "model": {"type": "string", "description": "Configured model for the agent."},
+        "models": {"type": "array", "items": {"type": "string"}, "description": "Every model that actually served a call (fallbacks included)."},
+        "model_calls": {"type": "integer", "minimum": 0},
+        "cached_replays": {"type": "integer", "minimum": 0},
+        "prompt_tokens": {"type": "integer", "minimum": 0, "description": "input + cache_creation + cache_read tokens."},
+        "completion_tokens": {"type": "integer", "minimum": 0},
+        "cache_read_tokens": {"type": "integer", "minimum": 0},
+        "cache_write_tokens": {"type": "integer", "minimum": 0},
+        "cost_usd": {"type": ["number", "null"], "minimum": 0}
+      }
+    }
+  }
+}

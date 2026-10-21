@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from tools.python_exec import SANDBOX_IMAGE, ensure_sandbox
+from tools import test_runner
 from tools.test_runner import MAX_XML_BYTES, parse_junit, pytest_command, run_pytest
 
 requires_docker = unittest.skipUnless(shutil.which("docker"), "Docker is not available")
@@ -78,7 +79,7 @@ class RunPytestTests(unittest.TestCase):
         (self.workspace / "tests").mkdir(parents=True)
         for name in ("test_calc.py", "test_other.py"):
             (self.workspace / "tests" / name).write_text("def test_x(): pass\n", encoding="utf-8")
-        for target in ("tools.test_runner.subprocess.Popen", "tools.test_runner.kill_container"):
+        for target in ("tools.python_exec.subprocess.Popen", "tools.python_exec.kill_container"):
             patcher = mock.patch(target, FakePopen if "Popen" in target else mock.Mock())
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -89,6 +90,21 @@ class RunPytestTests(unittest.TestCase):
     def run_with(self, **script):
         FakePopen.script = script
         return run_pytest(self.workspace, timeout_seconds=5)
+
+    def test_qa_output_root_holds_the_junit_folder(self) -> None:
+        root = Path(self._tmp.name) / "host" / "qa-out"
+        seen = []
+        original = test_runner.tempfile.TemporaryDirectory
+
+        def recording(*args, **kwargs):
+            seen.append(kwargs.get("dir"))
+            return original(*args, **kwargs)
+
+        with mock.patch.dict("os.environ", {"QA_OUTPUT_ROOT": str(root)}), \
+                mock.patch.object(test_runner.tempfile, "TemporaryDirectory", recording):
+            self.run_with(xml=JUNIT.format(details="tb"), exit_code=1)
+        self.assertEqual(seen, [str(root)])
+        self.assertTrue(root.is_dir())
 
     def test_exit_0_and_1_are_loaded(self) -> None:
         xml = JUNIT.format(details="tb")

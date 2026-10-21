@@ -12,6 +12,7 @@ import httpx2
 from agents.pm_agent import PMAgent, PMConfig
 from messaging.broker import A2ABroker
 from messaging.endpoints import register_team_agents
+from orchestration.services import RunServices
 from orchestration.team import (
     RECURSION_LIMIT,
     build_team_graph,
@@ -24,7 +25,9 @@ from orchestration.team import (
     run_team,
     team_clients,
 )
+from tests import TEST_ENV
 from tests.team_fakes import (
+    token_usage,
     FakeCoder,
     FakePMClient,
     FakeQA,
@@ -45,9 +48,11 @@ def make_pm(*responses) -> PMAgent:
     return PMAgent(PMConfig(), client=FakePMClient(list(responses)))
 
 
-def api_error() -> anthropic.APIConnectionError:
+def api_error() -> anthropic.AuthenticationError:
+    """A permanent model error: reported at once, never retried (FR-205)."""
     request = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
-    return anthropic.APIConnectionError(request=request)
+    response = httpx2.Response(401, request=request)
+    return anthropic.AuthenticationError("invalid x-api-key", response=response, body=None)
 
 
 def flat_criteria(tasks: list[dict]) -> list[str]:
@@ -140,7 +145,7 @@ class DispatchAndCoderNodeTests(TeamTestCase):
         self.assertEqual(
             update["code_output"], [{"task_id": "T1", "path": "t1.py", "content": "print('T1')\n"}]
         )
-        self.assertEqual(update["usage"], {"input_tokens": 110, "output_tokens": 55})
+        self.assertEqual(update["usage"], token_usage(110, 55))
 
         task_id, task_text, workspace = coder.calls[0]
         task = state["tasks"][0]
@@ -205,6 +210,26 @@ class FullGraphTests(TeamTestCase):
         self.assertEqual(completion_order, ["T1", "T2", "T3"])
 
 
+class RunServicesTests(TeamTestCase):
+    def test_run_team_uses_the_services_run_id_and_attaches_the_agents(self) -> None:
+        services = RunServices.create("20261020-000000-abc123", env=TEST_ENV)
+        pm = make_pm(pm_response(spec_payload(1)))
+        final = run_team(
+            REQUIREMENT, pm=pm, coder=FakeCoder(), workspace_root=self.workspace,
+            qa=FakeQA([qa_result("complete")]), services=services,
+        )
+        self.assertEqual(final["run_id"], services.run_id)
+        self.assertEqual(Path(final["workspace"]).name, services.run_id)
+        self.assertIs(pm._caller._services, services)
+
+    def test_a_fresh_run_id_is_made_without_services(self) -> None:
+        final = run_team(
+            REQUIREMENT, pm=make_pm(pm_response(spec_payload(1))), coder=FakeCoder(),
+            workspace_root=self.workspace, qa=FakeQA([qa_result("complete")]),
+        )
+        self.assertRegex(final["run_id"], r"^\d{8}-\d{6}-[0-9a-f]{6}$")
+
+
 class TaskCapTests(TeamTestCase):
     def setUp(self) -> None:
         super().setUp()
@@ -233,7 +258,7 @@ class TaskCapTests(TeamTestCase):
         self.assert_capped(final, coder, "pm", 6)
         # PM and Coder: 260 in, 130 out; one reflection (20 in, 10 out);
         # QA: one scripted iteration (100 in, 50 out).
-        self.assertEqual(final["usage"], {"input_tokens": 380, "output_tokens": 190})
+        self.assertEqual(final["usage"], token_usage(380, 190))
 
     def test_failed_consolidation_falls_back_to_merging_the_original_tasks(self) -> None:
         dropped = copy.deepcopy(regroup_payload(self.original, 6))

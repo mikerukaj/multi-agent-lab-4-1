@@ -29,9 +29,39 @@ import anthropic
 from dotenv import load_dotenv
 from langgraph.graph import END, START, StateGraph
 
-from agents.llm import EFFORT_LEVELS, MAX_TOKENS, add_tokens, refusal_message, with_fallbacks
+from agents.llm import (
+    EFFORT_LEVELS,
+    MAX_TOKENS,
+    SMALL_MODEL,
+    check_model_settings,
+    fallbacks_from_env,
+    resolve_fallbacks,
+    NOT_JSON,
+    ModelCaller,
+    add_usage,
+    cache_marker,
+    failure_message,
+    refusal_message,
+    stable_blocks,
+    system_blocks,
+    with_fallbacks,
+    zero_usage,
+)
 from agents.memory import SemanticMemory, SlidingWindowBuffer, Turn
-from orchestration.state import CritiqueItem, FindingResponse, Reflection
+from orchestration.services import RunServices
+from orchestration.state import (
+    CoderSummaryReply,
+    CritiqueItem,
+    CritiqueReply,
+    DependencyFailure,
+    ExecPythonInput,
+    FindingResponse,
+    ReadFileInput,
+    Reflection,
+    WriteFileInput,
+)
+from resilience.classify import BUDGET_EXCEEDED, is_unavailable
+from orchestration.validation import first_problems, validate
 from tools import dispatch_tool, session_tool_definitions
 from tools.mcp_client import McpFileTools, McpUnavailableError
 from tools.python_exec import (
@@ -45,9 +75,14 @@ from tools.python_exec import (
 MAX_STEPS_CAP = 10
 MAX_REFLECTION_ROUNDS = 3
 RESPONSE_ACTIONS = ("fixed", "disputed", "not_addressed")
+TOOL_INPUTS = {
+    "read_file": ReadFileInput, "write_file": WriteFileInput, "exec_python": ExecPythonInput
+}
+"""The ``TypedDict`` each tool's model-supplied input must match before it runs."""
 PROTECTED_PATHS = ("tests", ".qa")
 """Workspace folders the Coder may read but never write (QA owns them, FR-111)."""
-TERMINAL_STATUSES = ("refused", "error")
+TERMINAL_STATUSES = ("refused", "error", "dependency_unavailable", "budget_exceeded")
+"""Statuses that end a session at once: no closing summary call is made after them."""
 
 SYSTEM_PROMPT = """\
 You are the Coder Agent in an autonomous software team. You receive one coding task \
@@ -148,7 +183,7 @@ CRITIQUE_FORMAT = {
 class CoderConfig:
     """Settings for the Coder Agent; ``from_env`` applies ``CODER_*`` overrides."""
 
-    model: str = "claude-sonnet-5-5"
+    model: str = SMALL_MODEL
     effort: str = "medium"
     max_steps: int = MAX_STEPS_CAP
     exec_timeout_seconds: float = 30.0
@@ -156,9 +191,17 @@ class CoderConfig:
     memory_top_k: int = 3
     workspace_root: Path = Path("workspace")
     chroma_path: Path = Path(".chroma")
-    use_fallbacks: bool = True
+    use_fallbacks: bool | None = None
+    """``None`` means on if the model supports server-side refusal fallback."""
     sandbox_image: str = SANDBOX_IMAGE
     reflection_rounds: int = 1
+    chroma_host: str | None = None
+    """``CHROMA_HOST``: a Chroma server for the long-term memory (embedded when unset)."""
+    chroma_port: int = 8000
+
+    warnings: list[str] = field(default_factory=list, init=False, repr=False,
+                                compare=False)
+    """Settings the capability table could not check (an unknown model)."""
 
     def __post_init__(self) -> None:
         if not self.model or not self.sandbox_image:
@@ -173,6 +216,9 @@ class CoderConfig:
             raise ValueError("exec_timeout_seconds must be greater than 0")
         if self.window_turns < 1 or self.memory_top_k < 1:
             raise ValueError("window_turns and memory_top_k must be at least 1")
+        self.use_fallbacks = resolve_fallbacks(self.model, self.use_fallbacks)
+        self.warnings = check_model_settings("coder", self.model, self.effort,
+                                             self.use_fallbacks)
 
     @classmethod
     def from_env(cls) -> "CoderConfig":
@@ -192,10 +238,11 @@ class CoderConfig:
             ),
             workspace_root=Path(env.get("CODER_WORKSPACE", defaults.workspace_root)),
             chroma_path=Path(env.get("CODER_CHROMA_PATH", defaults.chroma_path)),
-            use_fallbacks=env.get("CODER_USE_FALLBACKS", "true").lower()
-            not in ("0", "false", "no"),
+            use_fallbacks=fallbacks_from_env(env.get("CODER_USE_FALLBACKS")),
             sandbox_image=env.get("CODER_SANDBOX_IMAGE", defaults.sandbox_image),
             reflection_rounds=int(env.get("CODER_REFLECTION_ROUNDS", defaults.reflection_rounds)),
+            chroma_host=env.get("CHROMA_HOST") or None,
+            chroma_port=int(env.get("CHROMA_PORT", defaults.chroma_port)),
         )
 
 
@@ -231,12 +278,16 @@ class CoderResult:
     files_written: list[str] = field(default_factory=list)
     steps_used: int = 0
     duration_seconds: float = 0.0
-    usage: dict = field(default_factory=lambda: {"input_tokens": 0, "output_tokens": 0})
+    usage: dict = field(default_factory=zero_usage)
     steps: list[Step] = field(default_factory=list)
     run_id: str = ""
     workspace: str = ""
     error: str | None = None
     finding_responses: list[FindingResponse] = field(default_factory=list)
+    validation_problems: list[str] = field(default_factory=list)
+    """Why the closing summary failed validation, if it did (the result then falls back)."""
+    failure: DependencyFailure | None = None
+    """The model call that could not be served, when that ended the run (FR-209c)."""
 
     def to_dict(self) -> dict:
         """Return a JSON-serialisable copy of this result."""
@@ -251,6 +302,7 @@ class ReflectionResult:
     result: CoderResult
     status: str
     usage: dict
+    failure: DependencyFailure | None = None
 
     def to_dict(self) -> dict:
         """Return a JSON-serialisable copy of this result."""
@@ -275,6 +327,7 @@ class AgentState(TypedDict):
     error: str | None
     usage: dict
     result: CoderResult | None
+    failure: DependencyFailure | None
 
 
 def new_run_id() -> str:
@@ -283,13 +336,18 @@ def new_run_id() -> str:
 
 
 def build_request(
-    config: CoderConfig, messages: list, tools: list[dict], output_format: dict | None = None
+    config: CoderConfig,
+    messages: list,
+    tools: list[dict],
+    output_format: dict | None = None,
+    cache_ttl: str = "off",
 ) -> dict:
     """Assemble the keyword arguments for one ``beta.messages.create`` call.
 
     ``system`` and ``tools`` never change within a run, which keeps the history
-    valid for Sonnet 5.5's preserved thinking (research R3). ``tools`` is the
-    session's list from ``session_tool_definitions``.
+    valid for preserved thinking (research R3). ``tools`` is the session's list from
+    ``session_tool_definitions``. With a ``cache_ttl``, the system block is cache-marked
+    and top-level ``cache_control`` caches the growing, append-only history (R7).
     """
     output_config: dict[str, Any] = {"effort": config.effort}
     if output_format:
@@ -297,12 +355,15 @@ def build_request(
     request = {
         "model": config.model,
         "max_tokens": MAX_TOKENS,
-        "system": SYSTEM_PROMPT,
+        "system": system_blocks(SYSTEM_PROMPT, cache_ttl),
         "tools": tools,
         "messages": messages,
         "thinking": {"type": "adaptive", "display": "summarized"},
         "output_config": output_config,
     }
+    marker = cache_marker(cache_ttl)
+    if marker:
+        request["cache_control"] = marker
     return with_fallbacks(request, config.use_fallbacks)
 
 
@@ -320,17 +381,45 @@ class CoderAgent:
         client=None,
         on_step: Callable[[Step], None] | None = None,
         file_tools=McpFileTools,
+        services: RunServices | None = None,
     ) -> None:
         self.config = config or CoderConfig.from_env()
         self._file_tools_factory = file_tools
         self._session = None
         self._tools: list[dict] = []
         ensure_sandbox(self.config.sandbox_image)
-        self._client = client or anthropic.Anthropic(max_retries=3)
+        # The SDK's own retries are off: the run's dependency guard retries (research R3).
+        self._client = client or anthropic.Anthropic(max_retries=0)
+        self._services = services or RunServices.create()
+        self._caller = ModelCaller("coder", self._client, self._services)
         self._on_step = on_step
         self._window = SlidingWindowBuffer(self.config.window_turns)
-        self._memory = SemanticMemory(self.config.chroma_path)
+        self._memory = SemanticMemory(
+            self.config.chroma_path, guard=self._memory_guard(),
+            host=self.config.chroma_host, port=self.config.chroma_port,
+        )
         self._graph = self._build_graph()
+
+    def attach(self, services: RunServices) -> None:
+        """Use ``services`` (the run's shared helpers) for every later call."""
+        self._services = services
+        self._caller = ModelCaller("coder", self._client, services)
+        self._memory.guard = self._memory_guard()
+
+    def _memory_guard(self):
+        target = (f"{self.config.chroma_host}:{self.config.chroma_port}"
+                  if self.config.chroma_host else str(self.config.chroma_path))
+        return self._services.guard("chroma", target)
+
+    def _open_files(self, workspace: Path):
+        """An MCP file-tool session for ``workspace``, guarded by the run's ``mcp`` breaker."""
+        return self._file_tools_factory(
+            workspace, protect=PROTECTED_PATHS,
+            guard=self._services.guard("mcp", str(workspace)),
+        )
+
+    def _sandbox_guard(self):
+        return self._services.guard("sandbox", self.config.sandbox_image)
 
     def run(
         self, task: str, workspace: Path | None = None, answer_ids: Sequence[str] = ()
@@ -361,7 +450,7 @@ class CoderAgent:
         else:
             workspace = workspace.resolve()
             workspace.mkdir(parents=True, exist_ok=True)
-        self._memory.add(run_id, "task", task)
+        self._remember(run_id, "task", task)
 
         try:
             final = self._run_session(run_id, task, workspace)
@@ -377,7 +466,7 @@ class CoderAgent:
         )
         self._window.add(Turn(task=task, reply=result.explanation))
         if result.explanation:
-            self._memory.add(run_id, "result", f"Task: {task}\nResult: {result.explanation}")
+            self._remember(run_id, "result", f"Task: {task}\nResult: {result.explanation}")
         return result
 
     def reflect(self, brief: str, workspace: Path) -> ReflectionResult:
@@ -390,7 +479,7 @@ class CoderAgent:
         """
         workspace = Path(workspace).resolve()
         rounds: list[Reflection] = []
-        usage = {"input_tokens": 0, "output_tokens": 0}
+        usage = zero_usage()
         result = None
         for number in range(1, self.config.reflection_rounds + 1):
             items, failure, usage = self._critique_round(brief, workspace, usage)
@@ -399,7 +488,7 @@ class CoderAgent:
                 break
             ids = [item["item_id"] for item in items]
             result = self.run(render_revision_task(brief, items), workspace, answer_ids=ids)
-            usage = add_tokens(usage, result.usage["input_tokens"], result.usage["output_tokens"])
+            usage = add_usage(usage, result.usage)
             rounds.append(
                 Reflection(
                     before_iteration=0,
@@ -413,54 +502,60 @@ class CoderAgent:
             )
             if result.status in TERMINAL_STATUSES:
                 break
-        return ReflectionResult(rounds=rounds, result=result, status=result.status, usage=usage)
+        return ReflectionResult(
+            rounds=rounds, result=result, status=result.status, usage=usage,
+            failure=result.failure,
+        )
 
     def _critique_round(
         self, brief: str, workspace: Path, usage: dict
     ) -> tuple[list[CritiqueItem], CoderResult | None, dict]:
         """Read the sources over MCP and critique them; return items or a failed result."""
         try:
-            with self._file_tools_factory(workspace, protect=PROTECTED_PATHS) as session:
+            with self._open_files(workspace) as session:
                 sources = _read_sources(session, workspace)
         except McpUnavailableError as error:
             return [], _unavailable_result("", workspace, error, time.monotonic()), usage
         for _ in range(2):  # One retry if the critique lists nothing.
-            status, payload, usage = self._critique(brief, sources, usage)
+            status, payload, usage, failure = self._critique(brief, sources, usage)
             if status != "completed":
-                return [], _failed_result(status, payload, workspace), usage
+                return [], _failed_result(status, payload, workspace, failure), usage
             if payload:
                 return _number_items(payload), None, usage
         message = "Self-critique listed no potential bugs or edge cases, twice."
         return [], _failed_result("error", message, workspace), usage
 
     def _critique(self, brief: str, sources: dict[str, str], usage: dict):
-        """Make one critique call; return ``(status, items or error text, usage)``."""
+        """Make one critique call; return ``(status, items or error text, usage, failure)``."""
+        ttl = self._services.prompt_cache_ttl
         request = {
             "model": self.config.model,
             "max_tokens": MAX_TOKENS,
-            "system": CRITIQUE_SYSTEM_PROMPT,
-            "messages": [{"role": "user", "content": _critique_prompt(brief, sources)}],
+            "system": system_blocks(CRITIQUE_SYSTEM_PROMPT, ttl),
+            "messages": [{"role": "user", "content": _critique_content(brief, sources, ttl)}],
             "thinking": {"type": "adaptive"},
             "output_config": {"effort": self.config.effort, "format": CRITIQUE_FORMAT},
         }
-        try:
-            response = self._client.beta.messages.create(
-                **with_fallbacks(request, self.config.use_fallbacks)
-            )
-        except anthropic.APIError as error:
-            return "error", f"Critique call failed: {error}", usage
-        usage = _add_usage(usage, response.usage)
-        if response.stop_reason == "refusal":
-            return "refused", refusal_message(response.stop_details), usage
-        text = "".join(block.text for block in response.content if block.type == "text")
-        try:
-            return "completed", list(json.loads(text)["items"]), usage
-        except (json.JSONDecodeError, KeyError, TypeError):
-            return "error", f"Critique output is not valid JSON: {text[:200]!r}", usage
+        reply = self._caller.call(
+            with_fallbacks(request, self.config.use_fallbacks), CritiqueReply
+        )
+        usage = add_usage(usage, reply.usage)
+        if reply.failure:
+            message = f"Critique call failed: {failure_message(reply.failure)}"
+            return _failure_status(reply.failure), message, usage, reply.failure
+        if reply.refusal:
+            return "refused", reply.refusal, usage, None
+        if reply.problems:
+            if reply.problems[0].startswith(NOT_JSON):
+                text = f"Critique output is not valid JSON: {reply.text[:200]!r}"
+                return "error", text, usage, None
+            problems = first_problems(reply.problems)
+            return "error", f"Critique output failed validation: {problems}", usage, None
+        return "completed", list(reply.data["items"]), usage, None
 
     def _run_session(self, run_id: str, task: str, workspace: Path) -> AgentState:
         """Run the graph inside one MCP file-tool session for ``workspace``."""
-        with self._file_tools_factory(workspace, protect=PROTECTED_PATHS) as session:
+        with self._open_files(workspace) as session:
             self._session = session
             self._tools = session_tool_definitions(session)
             try:
@@ -492,9 +587,7 @@ class CoderAgent:
                 {"role": "user", "content": _first_user_message(state["task"], state["window"])}
             )
         query = f"{state['task']}\n{_latest_observation(messages)}"
-        hits = self._memory.query(
-            query, top_k=self.config.memory_top_k, exclude_run_id=state["run_id"]
-        )
+        hits = self._recall_memories(query, state["run_id"])
         new_hits = [(id_, doc) for id_, doc in hits if id_ not in state["injected_memory_ids"]]
         if new_hits:
             messages.append({"role": "system", "content": _render_memories(new_hits)})
@@ -505,18 +598,19 @@ class CoderAgent:
 
     def _think(self, state: AgentState) -> dict:
         """Ask the model for the next Thought and Action."""
-        try:
-            response = self._client.beta.messages.create(
-                **build_request(self.config, state["messages"], self._tools)
-            )
-        except anthropic.APIError as error:
-            return {"status": "error", "error": f"Model call failed: {error}"}
-
+        reply = self._caller.call(build_request(
+            self.config, state["messages"], self._tools,
+            cache_ttl=self._services.prompt_cache_ttl,
+        ))
+        if reply.failure:
+            return {"status": _failure_status(reply.failure),
+                    "error": failure_message(reply.failure), "failure": reply.failure}
+        response = reply.response
         step_count = state["step_count"] + 1
         update = {
             "messages": state["messages"] + [{"role": "assistant", "content": response.content}],
             "step_count": step_count,
-            "usage": _add_usage(state["usage"], response.usage),
+            "usage": add_usage(state["usage"], reply.usage),
             "stop_reason": response.stop_reason,
             "steps": state["steps"] + [Step(step_count, _thought_text(response.content))],
         }
@@ -535,14 +629,7 @@ class CoderAgent:
         last_execution = state["last_execution"]
         results, actions = [], []
         for block in _tool_uses(state["messages"][-1]):
-            text, is_error, execution = dispatch_tool(
-                block.name,
-                block.input,
-                workspace,
-                self.config.exec_timeout_seconds,
-                self.config.sandbox_image,
-                file_tools=self._session,
-            )
+            text, is_error, execution = self._run_tool(block, workspace)
             results.append(
                 {
                     "type": "tool_result",
@@ -557,7 +644,7 @@ class CoderAgent:
                 files_written.append(path)
             last_execution = execution or last_execution
             observation = f"{_describe_call(block.name, block.input)} -> {text}"
-            self._memory.add(state["run_id"], "observation", observation)
+            self._remember(state["run_id"], "observation", observation)
 
         step = replace(state["steps"][-1], actions=actions)
         if self._on_step:
@@ -569,23 +656,53 @@ class CoderAgent:
             "last_execution": last_execution,
         }
 
+    def _run_tool(self, block, workspace: Path) -> tuple[str, bool, ExecutionResult | None]:
+        """Check one requested tool call, then run it (FR-219a: never act on bad input)."""
+        session_names = {tool["name"] for tool in self._tools}
+        if block.name not in session_names or block.name not in TOOL_INPUTS:
+            return f"Unknown tool: {block.name}", True, None
+        problems = validate(block.input, TOOL_INPUTS[block.name])
+        if problems:
+            return f"Invalid tool input: {first_problems(problems)}", True, None
+        sandbox = block.name == "exec_python"
+        guard = self._sandbox_guard() if sandbox else getattr(self._session, "guard", None)
+        return self._services.tool_call(
+            block.name, {"path": block.input["path"]},
+            lambda: dispatch_tool(
+                block.name, block.input, workspace, self.config.exec_timeout_seconds,
+                self.config.sandbox_image, file_tools=self._session, guard=guard,
+                run_id=self._services.run_id,
+            ),
+            describe=_describe_tool_result, event="sandbox_run" if sandbox else "tool_call",
+            guard=guard,
+        )
+
+    def _remember(self, run_id: str, kind: str, text: str) -> None:
+        """Store a memory, as a traced ``memory.add`` tool call."""
+        self._services.tool_call("memory.add", {"kind": kind},
+                                 lambda: self._memory.add(run_id, kind, text),
+                                 guard=getattr(self._memory, "guard", None))
+
+    def _recall_memories(self, query: str, exclude_run_id: str) -> list:
+        """Query the long-term memory, as a traced ``memory.query`` tool call."""
+        return self._services.tool_call(
+            "memory.query", {"top_k": self.config.memory_top_k},
+            lambda: self._memory.query(query, top_k=self.config.memory_top_k,
+                                       exclude_run_id=exclude_run_id),
+            guard=getattr(self._memory, "guard", None),
+        )
+
     def _finalize(self, state: AgentState) -> dict:
         """Ask for the summary, then fill code and execution from ground truth."""
         status = "completed" if state["status"] == "running" else state["status"]
-        error, usage, messages = state["error"], state["usage"], state["messages"]
-        summary = {"plan": [], "explanation": error or "", "main_file": ""}
+        closing = {"status": status, "error": state["error"], "usage": state["usage"],
+                   "messages": state["messages"], "failure": state["failure"],
+                   "problems": [], "summary": {"plan": [], "explanation": state["error"] or "",
+                                               "main_file": ""}}
         if status not in TERMINAL_STATUSES:
-            messages = messages + [{"role": "user", "content": _closing_content(messages[-1])}]
-            try:
-                response = self._client.beta.messages.create(
-                    **build_request(self.config, messages, self._tools, SUMMARY_FORMAT)
-                )
-                usage = _add_usage(usage, response.usage)
-                summary = _parse_summary(response)
-            except anthropic.APIError as api_error:
-                status, error = "error", f"Summary call failed: {api_error}"
-                summary["explanation"] = error
-
+            closing = self._closing_summary(closing)
+        status, error, usage = closing["status"], closing["error"], closing["usage"]
+        summary, messages = closing["summary"], closing["messages"]
         workspace = Path(state["workspace"])
         main_file = _choose_main_file(summary["main_file"], state)
         code, missing = ("", True)
@@ -606,8 +723,29 @@ class CoderAgent:
             run_id=state["run_id"],
             workspace=str(workspace),
             error=error,
+            validation_problems=closing["problems"],
+            failure=closing["failure"],
         )
         return {"messages": messages, "status": status, "usage": usage, "result": result}
+
+    def _closing_summary(self, closing: dict) -> dict:
+        """Ask for the structured summary; return ``closing`` updated with its outcome."""
+        messages = closing["messages"] + [
+            {"role": "user", "content": _closing_content(closing["messages"][-1])}
+        ]
+        reply = self._caller.call(
+            build_request(self.config, messages, self._tools, SUMMARY_FORMAT,
+                          self._services.prompt_cache_ttl),
+            CoderSummaryReply,
+        )
+        closing = {**closing, "messages": messages,
+                   "usage": add_usage(closing["usage"], reply.usage)}
+        if reply.failure:
+            error = f"Summary call failed: {failure_message(reply.failure)}"
+            return {**closing, "failure": reply.failure, "error": error,
+                    "status": _failure_status(reply.failure),
+                    "summary": {**closing["summary"], "explanation": error}}
+        return {**closing, "summary": _parse_summary(reply), "problems": reply.problems}
 
     def _execution_for(
         self, workspace: Path, main_file: str | None, last: ExecutionResult | None
@@ -618,11 +756,13 @@ class CoderAgent:
         if last and os.path.normpath(last.path) == os.path.normpath(main_file):
             return last
         try:
-            return exec_python(
-                workspace, main_file, self.config.exec_timeout_seconds, self.config.sandbox_image
+            result = exec_python(
+                workspace, main_file, self.config.exec_timeout_seconds,
+                self.config.sandbox_image, self._sandbox_guard(), self._services.run_id,
             )
         except (ValueError, FileNotFoundError):
             return None
+        return None if result.failure else result
 
 
 def render_revision_task(brief: str, items: list[CritiqueItem]) -> str:
@@ -647,9 +787,12 @@ def render_revision_task(brief: str, items: list[CritiqueItem]) -> str:
     return "\n".join(lines)
 
 
-def _critique_prompt(brief: str, sources: dict[str, str]) -> str:
+def _critique_content(brief: str, sources: dict[str, str], ttl: str) -> list[dict]:
+    """The critique's user content: the sources (re-sent every round, so cache-marked),
+    then the brief."""
     files = "\n\n".join(f"### {path}\n```python\n{text}\n```" for path, text in sources.items())
-    return f"Specification and brief:\n{brief}\n\nSource files:\n\n{files or '(none)'}"
+    return stable_blocks([f"Source files:\n\n{files or '(none)'}"],
+                         f"Specification and brief:\n{brief}", ttl)
 
 
 def _read_sources(session, workspace: Path) -> dict[str, str]:
@@ -678,11 +821,20 @@ def _number_items(items: list[dict]) -> list[CritiqueItem]:
     ]
 
 
-def _failed_result(status: str, message: str, workspace: Path) -> CoderResult:
+def _failed_result(
+    status: str, message: str, workspace: Path, failure: DependencyFailure | None = None
+) -> CoderResult:
     return CoderResult(
         code="", explanation=message, plan=[], execution_result=None, status=status,
-        workspace=str(workspace), error=message,
+        workspace=str(workspace), error=message, failure=failure,
     )
+
+
+def _failure_status(failure: DependencyFailure) -> str:
+    """The Coder status for a model call that could not be served (FR-205, FR-223)."""
+    if failure["error_type"] == BUDGET_EXCEEDED:
+        return "budget_exceeded"
+    return "dependency_unavailable" if is_unavailable(failure) else "error"
 
 
 def _unavailable_result(
@@ -730,8 +882,9 @@ def _initial_state(run_id: str, task: str, workspace: Path, window: list[Turn]) 
         stop_reason=None,
         status="running",
         error=None,
-        usage={"input_tokens": 0, "output_tokens": 0},
+        usage=zero_usage(),
         result=None,
+        failure=None,
     )
 
 
@@ -776,22 +929,23 @@ def _closing_content(last_message: dict) -> list[dict]:
     return pending + [{"type": "text", "text": SUMMARY_PROMPT}]
 
 
-def _parse_summary(response) -> dict:
-    """Read the structured summary, tolerating a refusal or malformed text."""
-    text = "".join(block.text for block in response.content if block.type == "text")
-    if response.stop_reason == "refusal":
-        explanation = refusal_message(response.stop_details)
-        return {"plan": [], "explanation": explanation, "main_file": ""}
-    try:
-        data = json.loads(text)
-        return {
-            "plan": [str(step) for step in data["plan"]],
-            "explanation": str(data["explanation"]),
-            "main_file": str(data["main_file"]),
-            "finding_responses": _parse_responses(data.get("finding_responses", [])),
-        }
-    except (json.JSONDecodeError, KeyError, TypeError):
-        return {"plan": [], "explanation": text, "main_file": ""}
+def _parse_summary(reply) -> dict:
+    """Read the validated summary, falling back for a refusal or a reply that failed.
+
+    The fallback keeps the raw text as the explanation; the code and its execution
+    still come from the workspace (ground truth), so a bad summary never loses work.
+    """
+    if reply.refusal:
+        return {"plan": [], "explanation": reply.refusal, "main_file": ""}
+    if reply.data is None:
+        return {"plan": [], "explanation": reply.text, "main_file": ""}
+    data = reply.data
+    return {
+        "plan": list(data["plan"]),
+        "explanation": data["explanation"],
+        "main_file": data["main_file"],
+        "finding_responses": _parse_responses(data["finding_responses"]),
+    }
 
 
 def _parse_responses(items: list) -> list[FindingResponse]:
@@ -837,9 +991,13 @@ def _thought_text(content: list) -> str:
     return "\n".join(parts)
 
 
-def _add_usage(total: dict, usage) -> dict:
-    """Add a response's ``usage`` object to ``total``."""
-    return add_tokens(total, usage.input_tokens, usage.output_tokens)
+def _describe_tool_result(result: tuple) -> dict:
+    """The span outputs and event details of one ``dispatch_tool`` result."""
+    _, is_error, execution = result
+    outputs = {"is_error": is_error}
+    if execution is not None:
+        outputs.update(exit_code=execution.exit_code, timed_out=execution.timed_out)
+    return outputs
 
 
 def _describe_call(name: str, tool_input: dict) -> str:
